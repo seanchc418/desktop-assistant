@@ -400,6 +400,9 @@ jobs:
             ${{ steps.seal.outputs.sealed }}/conversations.db
             ${{ steps.seal.outputs.sealed }}/conversations.db-wal
             ${{ steps.seal.outputs.sealed }}/conversations.db-shm
+            ${{ steps.seal.outputs.sealed }}/partial-conversations.db
+            ${{ steps.seal.outputs.sealed }}/partial-cleanup.marker
+            ${{ steps.seal.outputs.sealed }}/handoff-report.json
             ${{ steps.seal.outputs.sealed }}/cleanup.marker
             ${{ steps.seal.outputs.sealed }}/manifest.json
           retention-days: 14
@@ -489,7 +492,7 @@ jobs:
           if ($env:SOURCE_ID -notmatch '^\d+$' -or (Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
           $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           if ($doc.tag -cne $tag -or $doc.collectorSid -ceq $doc.workerSid) { throw 'Manifest identity or run mismatch' }
-          $names = @('conversations.db','conversations.db-wal','conversations.db-shm','cleanup.marker')
+          $names = @('conversations.db','conversations.db-wal','conversations.db-shm','partial-conversations.db','partial-cleanup.marker','handoff-report.json','cleanup.marker')
           if (@(Compare-Object @($names | Sort-Object) @($doc.files.name | Sort-Object) -CaseSensitive).Count) { throw 'Manifest inventory mismatch' }
           function VerifySet($directory) {
             foreach ($file in $doc.files) {
@@ -498,12 +501,20 @@ jobs:
             }
           }
           VerifySet $download
+          $expectedArchive = @($names + 'manifest.json' | Sort-Object)
+          if (@(Compare-Object $expectedArchive @(Get-ChildItem -LiteralPath $download -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Downloaded file inventory mismatch' }
+          $handoff = Get-Content -LiteralPath (Join-Path $download 'handoff-report.json') -Raw | ConvertFrom-Json
+          if ($handoff.tag -cne $tag -or $handoff.handoffs.Count -ne 2) { throw 'Downloaded handoff mismatch' }
+          foreach ($mode in 'success','partial') {
+            $entry = @($handoff.handoffs | Where-Object mode -ceq $mode)
+            if ($entry.Count -ne 1 -or $entry[0].runId -cne "$tag-$mode" -or -not $entry[0].finallyPreserved -or -not $entry[0].hookPreserved -or $entry[0].initFailure -ne ($mode -eq 'partial')) { throw 'Downloaded handoff proof mismatch' }
+          }
           $negative = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "wal-negative-$tag")
           foreach ($name in ($names | Where-Object { $_ -ne 'conversations.db-wal' })) { Copy-Item -LiteralPath (Join-Path $download $name) -Destination $negative.FullName }
           $missingRejected = $false
           try { VerifySet $negative.FullName } catch { $missingRejected = $_.CategoryInfo.Category -eq 'ObjectNotFound' }
-          if (-not $missingRejected) { throw 'Missing WAL case failed' }
-          Write-Output 'Missing WAL rejected'
+          if (-not $missingRejected -or -not (Test-Path -LiteralPath (Join-Path $negative.FullName 'cleanup.marker') -PathType Leaf)) { throw 'Missing WAL case failed' }
+          Write-Output 'F387 missing WAL rejected; negative fixture marker preserved'
           $checkScript = Join-Path $env:RUNNER_TEMP "wal-check-$tag.cjs"
           @'
           const fs = require('node:fs');
@@ -529,7 +540,13 @@ jobs:
           }
           const dbOnly = check(false,[[1,'checkpointed']]);
           const restored = check(true,[[1,'checkpointed'],[2,'wal-only']]);
-          console.log(JSON.stringify({ dbOnly, restored }));
+          const partial = new DatabaseSync(path.join(source,'partial-conversations.db'),{readOnly:true});
+          try {
+            assert.equal(partial.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
+            assert.equal(partial.prepare('SELECT id FROM partial').get().id,1);
+            assert(fs.statSync(path.join(source,'partial-cleanup.marker')).size > 0);
+          } finally { partial.close(); }
+          console.log(JSON.stringify({ dbOnly, restored, partialDatabaseAndMarkerPreserved:true }));
           '@ | Set-Content -LiteralPath $checkScript -Encoding utf8
           $result = node $checkScript $download
           if ($LASTEXITCODE -ne 0) { throw 'SQLite verification failed' }
