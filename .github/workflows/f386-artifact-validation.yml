@@ -211,3 +211,248 @@ jobs:
           if (Compare-Object $before $after -Property Path,Hash) { throw 'Protected files changed' }
           Write-Output "Collector token: $($collector.Value); protected file hashes unchanged"
           $after | Select-Object Path,Hash | ConvertTo-Json -Compress
+
+
+  wal_capture:
+    if: github.repository == 'seanchc418/desktop-assistant'
+    runs-on: windows-2022
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      - name: Worker writes WAL, collector freezes and seals synthetic files
+        id: seal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $collector = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $account = 'f386-' + [guid]::NewGuid().ToString('N').Substring(0,12)
+          $password = ConvertTo-SecureString ('Az9!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))) -AsPlainText -Force
+          $worker = New-LocalUser -Name $account -Password $password -Description 'Disposable synthetic WAL writer'
+          $users = Get-LocalGroup -SID 'S-1-5-32-545'
+          if (-not (Get-LocalGroupMember -Group $users | Where-Object SID -eq $worker.SID)) { Add-LocalGroupMember -Group $users -Member $worker }
+          if ($collector -eq $worker.SID) { throw 'Identity collision' }
+          $root = Join-Path $env:SystemDrive "/f386-chain-$tag"
+          if (Test-Path -LiteralPath $root) { throw 'Workspace already exists' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $acl = [Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetOwner($collector)
+          $acl.SetAccessRuleProtection($true,$false)
+          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          }
+          $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $root -AclObject $acl
+          $inbox = New-Item -ItemType Directory -Path (Join-Path $root 'inbox')
+          $sealed = New-Item -ItemType Directory -Path (Join-Path $root 'sealed')
+          $inboxAcl = Get-Acl -LiteralPath $inbox.FullName
+          $inboxAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'Modify','ContainerInherit,ObjectInherit','None','Allow'))
+          Set-Acl -LiteralPath $inbox.FullName -AclObject $inboxAcl
+          $marker = Join-Path $sealed.FullName 'cleanup.marker'
+          Set-Content -LiteralPath $marker -Value ([guid]::NewGuid().ToString('N')) -NoNewline
+          $script = Join-Path $root 'producer.cjs'
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+          const { DatabaseSync } = require('node:sqlite');
+          const [inbox, marker, expectedUser, expectedSid] = process.argv.slice(2);
+          assert.equal(os.userInfo().username.toLowerCase(), expectedUser.toLowerCase());
+          assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
+          const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
+          const sid = execFileSync(whoami,['/user','/fo','csv','/nh'],{encoding:'utf8'});
+          assert(sid.includes(expectedSid));
+          const groups = execFileSync(whoami,['/groups','/fo','csv','/nh'],{encoding:'utf8'});
+          assert(!groups.includes('S-1-5-32-544'));
+          assert.throws(() => { const fd = fs.openSync(marker,'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
+          const db = new DatabaseSync(path.join(inbox,'live.db'));
+          try {
+            db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'checkpointed'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'wal-only');");
+            for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(path.join(inbox,'live.db'+suffix),path.join(inbox,'fixture.db'+suffix),fs.constants.COPYFILE_EXCL);
+          } finally { db.close(); }
+          console.log('Worker SID '+expectedSid+' captured candidate before closing SQLite; protected marker open denied');
+          '@ | Set-Content -LiteralPath $script -Encoding utf8
+          $scriptAcl = Get-Acl -LiteralPath $script
+          $scriptAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $script -AclObject $scriptAcl
+          $nodeExe = (Get-Command node -CommandType Application).Source
+          $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
+          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value
+          $stdout = Join-Path $root 'worker.log'
+          $stderr = Join-Path $root 'worker.err'
+          $process = Start-Process -FilePath $nodeExe -ArgumentList $workerArgs -Credential $cred -UseNewEnvironment -WorkingDirectory $inbox.FullName -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
+          Get-Content -LiteralPath $stdout
+          if ($process.ExitCode -ne 0) { Get-Content -LiteralPath $stderr; throw 'Worker failed' }
+          $names = 'fixture.db','fixture.db-wal','fixture.db-shm'
+          $held = @{}
+          try {
+            foreach ($name in $names) {
+              $source = Get-Item -LiteralPath (Join-Path $inbox.FullName $name)
+              if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $source.Length -le 0) { throw 'Invalid source' }
+              $held[$name] = [IO.File]::Open($source.FullName,'Open','Read','Read')
+            }
+            foreach ($name in $names) {
+              $destination = [IO.File]::Open((Join-Path $sealed.FullName $name),'CreateNew','Write','None')
+              try { $held[$name].CopyTo($destination) } finally { $destination.Dispose() }
+            }
+          } finally { foreach ($stream in $held.Values) { $stream.Dispose() } }
+          $items = foreach ($name in ($names + 'cleanup.marker')) {
+            $file = Get-Item -LiteralPath (Join-Path $sealed.FullName $name)
+            [ordered]@{ name=$name; bytes=$file.Length; sha256=(Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant() }
+          }
+          $manifest = Join-Path $sealed.FullName 'manifest.json'
+          [ordered]@{ tag=$tag; collectorSid=$collector.Value; workerSid=$worker.SID.Value; files=@($items) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest -Encoding utf8
+          $hash = (Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant()
+          Write-Output "Collector SID $($collector.Value); source handles excluded writers and deleters during sealing; manifest SHA-256 $hash"
+          "sealed=$($sealed.FullName)" >> $env:GITHUB_OUTPUT
+          "sha=$hash" >> $env:GITHUB_OUTPUT
+      - name: Publish sealed WAL source and marker
+        id: archive
+        if: ${{ always() && steps.seal.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wal-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.seal.outputs.sha }}
+          path: |
+            ${{ steps.seal.outputs.sealed }}/fixture.db
+            ${{ steps.seal.outputs.sealed }}/fixture.db-wal
+            ${{ steps.seal.outputs.sealed }}/fixture.db-shm
+            ${{ steps.seal.outputs.sealed }}/cleanup.marker
+            ${{ steps.seal.outputs.sealed }}/manifest.json
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+      - name: Wait for the other runner's exact receipt before removing the original marker
+        shell: pwsh
+        env:
+          SOURCE_ID: ${{ steps.archive.outputs.artifact-id }}
+          MANIFEST_SHA: ${{ steps.seal.outputs.sha }}
+          SEALED: ${{ steps.seal.outputs.sealed }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $marker = Join-Path $env:SEALED 'cleanup.marker'
+          $expected = "wal-receipt-$tag-$env:SOURCE_ID-$env:MANIFEST_SHA"
+          $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
+          function Valid($item) { return $null -ne $item -and $item.name -ceq $expected -and -not $item.expired -and $item.size_in_bytes -gt 0 -and $item.digest -match '^sha256:[a-f0-9]{64}$' }
+          if ((Valid $null) -or (Valid @{name="$expected-wrong";expired=$false;size_in_bytes=100;digest=('sha256:' + '0'*64)}) -or -not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Missing or wrong receipt control failed' }
+          Write-Output 'Missing/wrong receipt gated; marker present'
+          $receipt = $null
+          for ($i=0; $i -lt 16; $i++) {
+            try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $receipt = @($published.artifacts | Where-Object { Valid $_ }) | Select-Object -First 1 } catch { Write-Output 'Receipt listing temporarily unavailable' }
+            if ($receipt) { break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $receipt) { throw 'No matching remote receipt; marker preserved' }
+          $localManifest = (Get-FileHash -LiteralPath (Join-Path $env:SEALED 'manifest.json')).Hash.ToLowerInvariant()
+          if ($localManifest -cne $env:MANIFEST_SHA) { throw 'Local manifest changed; marker retained' }
+          $manifest = Get-Content -LiteralPath (Join-Path $env:SEALED 'manifest.json') -Raw | ConvertFrom-Json
+          foreach ($file in $manifest.files) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path $env:SEALED $file.name)).Hash.ToLowerInvariant()
+            if ($hash -cne $file.sha256) { throw 'Sealed file changed; marker retained' }
+          }
+          Remove-Item -LiteralPath $marker
+          if (Test-Path -LiteralPath $marker) { throw 'Marker still exists' }
+          Write-Output "Receipt artifact $($receipt.id) confirmed; original synthetic marker removed; archived files retained"
+
+  wal_verify:
+    if: github.repository == 'seanchc418/desktop-assistant'
+    runs-on: windows-2022
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      - name: Wait for this run's sealed source
+        id: locate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $pattern = '^wal-source-' + [regex]::Escape($tag) + '-([0-9a-f]{64})$'
+          $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
+          $source = $null
+          for ($i=0; $i -lt 16; $i++) {
+            try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $source = $published.artifacts | Where-Object { $_.name -cmatch $pattern -and -not $_.expired -and $_.size_in_bytes -gt 0 } | Select-Object -First 1 } catch { Write-Output 'Source listing temporarily unavailable' }
+            if ($source) { break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $source -or $source.name -cnotmatch $pattern) { throw 'No sealed source' }
+          "name=$($source.name)" >> $env:GITHUB_OUTPUT
+          "id=$($source.id)" >> $env:GITHUB_OUTPUT
+          "sha=$($Matches[1])" >> $env:GITHUB_OUTPUT
+      - name: Download the sealed source into an empty location
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ steps.locate.outputs.name }}
+          path: ${{ runner.temp }}/wal-source-${{ env.F386_RUN }}
+      - name: Verify all bytes, restore WAL and confirm the WAL-dependent row
+        id: check
+        shell: pwsh
+        env:
+          SOURCE_ID: ${{ steps.locate.outputs.id }}
+          MANIFEST_SHA: ${{ steps.locate.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $download = Join-Path $env:RUNNER_TEMP "wal-source-$env:F386_RUN"
+          $manifest = Join-Path $download 'manifest.json'
+          if ($env:SOURCE_ID -notmatch '^\d+$' -or (Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
+          $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if ($doc.tag -cne $tag -or $doc.collectorSid -ceq $doc.workerSid) { throw 'Manifest identity or run mismatch' }
+          $names = @('fixture.db','fixture.db-wal','fixture.db-shm','cleanup.marker')
+          if (@(Compare-Object @($names | Sort-Object) @($doc.files.name | Sort-Object) -CaseSensitive).Count) { throw 'Manifest inventory mismatch' }
+          function VerifySet($directory) {
+            foreach ($file in $doc.files) {
+              $item = Get-Item -LiteralPath (Join-Path $directory $file.name)
+              if ($item.PSIsContainer -or $item.Length -ne $file.bytes -or (Get-FileHash -LiteralPath $item.FullName).Hash -ine $file.sha256) { throw 'File integrity mismatch' }
+            }
+          }
+          VerifySet $download
+          $negative = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "wal-negative-$tag")
+          foreach ($name in ($names | Where-Object { $_ -ne 'fixture.db-wal' })) { Copy-Item -LiteralPath (Join-Path $download $name) -Destination $negative.FullName }
+          $missingRejected = $false
+          try { VerifySet $negative.FullName } catch { $missingRejected = $_.CategoryInfo.Category -eq 'ObjectNotFound' }
+          if (-not $missingRejected) { throw 'Missing WAL case failed' }
+          Write-Output 'Missing WAL rejected'
+          $checkScript = Join-Path $env:RUNNER_TEMP "wal-check-$tag.cjs"
+          @'
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { DatabaseSync } = require('node:sqlite');
+          const { createHash } = require('node:crypto');
+          const source = process.argv[2];
+          function check(includeWal, expected) {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(),'f386-restore-'));
+            for (const file of includeWal ? ['fixture.db','fixture.db-wal','fixture.db-shm'] : ['fixture.db']) fs.copyFileSync(path.join(source,file),path.join(root,file),fs.constants.COPYFILE_EXCL);
+            const db = new DatabaseSync(path.join(root,'fixture.db'));
+            try {
+              const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
+              const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name='synthetic'").get().sql;
+              const rows = db.prepare('SELECT id,value FROM synthetic ORDER BY id').all().map(({id,value})=>[id,value]);
+              assert.equal(integrity,'ok');
+              assert.equal(schema,'CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+              assert.deepEqual(rows,expected);
+              return {integrity, schema, rows, logicalSha256:createHash('sha256').update(JSON.stringify({schema,rows})).digest('hex')};
+            } finally { db.close(); }
+          }
+          const dbOnly = check(false,[[1,'checkpointed']]);
+          const restored = check(true,[[1,'checkpointed'],[2,'wal-only']]);
+          console.log(JSON.stringify({ dbOnly, restored }));
+          '@ | Set-Content -LiteralPath $checkScript -Encoding utf8
+          $result = node $checkScript $download
+          if ($LASTEXITCODE -ne 0) { throw 'SQLite verification failed' }
+          Write-Output $result
+          $receipt = Join-Path $env:RUNNER_TEMP "wal-receipt-$tag.json"
+          [ordered]@{ tag=$tag; artifactId=$env:SOURCE_ID; manifestSha256=$env:MANIFEST_SHA; restored=($result | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $receipt -Encoding utf8
+          "file=$receipt" >> $env:GITHUB_OUTPUT
+      - name: Publish exact successful verification receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wal-receipt-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.locate.outputs.id }}-${{ steps.locate.outputs.sha }}
+          path: ${{ steps.check.outputs.file }}
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: false
