@@ -70,3 +70,144 @@ jobs:
           if ($env:ARTIFACT_ID -notmatch '^\d+$' -or $env:ARTIFACT_DIGEST -notmatch '^[0-9a-f]{64}$') { throw 'Missing artifact metadata' }
           Write-Output "Artifact ID $env:ARTIFACT_ID SHA-256 $env:ARTIFACT_DIGEST"
           node .github/scripts/f386-fixture.cjs verify "$env:RUNNER_TEMP/f386-download-$env:F386_RUN" "$env:RUNNER_TEMP/f386-restore-$env:F386_RUN" "$env:MANIFEST_SHA256"
+
+
+  identity:
+    if: github.repository == 'seanchc418/desktop-assistant'
+    runs-on: windows-2022
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      - name: Verify two Windows identities and protect the synthetic WAL snapshot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $collector = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $account = 'f386-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
+          $generated = 'Az9!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+          $password = ConvertTo-SecureString $generated -AsPlainText -Force
+          Remove-Variable generated
+          $worker = New-LocalUser -Name $account -Password $password -Description 'Disposable F386 synthetic test worker'
+          $users = Get-LocalGroup -SID 'S-1-5-32-545'
+          if (-not (Get-LocalGroupMember -Group $users | Where-Object SID -eq $worker.SID)) {
+            Add-LocalGroupMember -Group $users -Member $worker
+          }
+          $root = Join-Path $env:SystemDrive ('/f386-canary-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
+          if (Test-Path -LiteralPath $root) { throw 'Canary path already exists' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $acl = [Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetOwner($collector)
+          $acl.SetAccessRuleProtection($true, $false)
+          foreach ($sid in @($collector, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          }
+          $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $root -AclObject $acl
+          foreach ($dir in 'working','frozen','sealed','restore','control') {
+            New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null
+          }
+          $control = Join-Path $root 'control/canary.bin'
+          Set-Content -LiteralPath $control -Value 'synthetic worker control'
+          $fileAcl = Get-Acl -LiteralPath $control
+          $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'Modify','Allow'))
+          Set-Acl -LiteralPath $control -AclObject $fileAcl
+          $controlDir = Join-Path $root 'control'
+          $fileAcl = Get-Acl -LiteralPath $controlDir
+          $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $controlDir -AclObject $fileAcl
+          $fixture = Join-Path $root 'fixture.cjs'
+          @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const { DatabaseSync } = require('node:sqlite');
+          const { createHash } = require('node:crypto');
+          const [phase, root] = process.argv.slice(2);
+          const files = ['fixture.db','fixture.db-wal','fixture.db-shm'];
+          const copy = (from, to) => files.forEach(file => fs.copyFileSync(path.join(root,from,file),path.join(root,to,file),fs.constants.COPYFILE_EXCL));
+          if (phase === 'prepare') {
+            const db = new DatabaseSync(path.join(root,'working',files[0]));
+            try {
+              db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'synthetic-alpha'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'synthetic-beta');");
+              copy('working','frozen');
+              copy('frozen','sealed');
+            } finally { db.close(); }
+          } else {
+            assert.equal(phase,'restore');
+            copy('sealed','restore');
+            const db = new DatabaseSync(path.join(root,'restore',files[0]));
+            try {
+              const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
+              const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name='synthetic'").get().sql;
+              const rows = db.prepare('SELECT id,value FROM synthetic ORDER BY id').all().map(({id,value}) => [id,value]);
+              assert.equal(integrity,'ok');
+              assert.equal(schema,'CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+              assert.deepEqual(rows,[[1,'synthetic-alpha'],[2,'synthetic-beta']]);
+              const logicalSha256 = createHash('sha256').update(JSON.stringify({schema,rows})).digest('hex');
+              console.log(JSON.stringify({integrity,schema,rowCount:rows.length,logicalSha256}));
+            } finally { db.close(); }
+          }
+          '@ | Set-Content -LiteralPath $fixture -Encoding utf8
+          node $fixture prepare $root
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic WAL generation failed' }
+          $targets = foreach ($dir in 'frozen','sealed') {
+            foreach ($name in 'fixture.db','fixture.db-wal','fixture.db-shm') { Join-Path $root "$dir/$name" }
+          }
+          $before = @($targets | Get-FileHash)
+          $probe = Join-Path $root 'probe.ps1'
+          @'
+          param([string]$Root,[string]$ExpectedSid)
+          $ErrorActionPreference = 'Stop'
+          try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+            if ($identity.User.Value -ne $ExpectedSid -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Unexpected worker token' }
+            Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          using Microsoft.Win32.SafeHandles;
+          public static class F386Access {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            private static extern SafeFileHandle CreateFile(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
+            public static int Probe(string p,uint a) {
+              using(var h=CreateFile(p,a,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
+                return h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+              }
+            }
+          }
+          "@
+            function Check($Relative,$Mask,$Expected) {
+              $actual = [F386Access]::Probe((Join-Path $Root $Relative),$Mask)
+              if ($actual -ne $Expected) { throw "Unexpected Windows result $actual for $Relative mask $Mask (expected $Expected)" }
+              Write-Output "$Relative mask $Mask -> $actual"
+            }
+            Check 'control/canary.bin' 2 0
+            Check '.' 64 5
+            foreach ($dir in 'frozen','sealed') {
+              Check $dir 64 5
+              Check $dir 65536 5
+              foreach ($file in 'fixture.db','fixture.db-wal','fixture.db-shm') {
+                foreach ($right in 2,4,65536,262144,524288) { Check "$dir/$file" $right 5 }
+              }
+            }
+            Write-Output "Worker token verified: $($identity.User.Value); administrator=false"
+            exit 0
+          } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+          '@ | Set-Content -LiteralPath $probe -Encoding utf8
+          $probeAcl = Get-Acl -LiteralPath $probe
+          $probeAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $probe -AclObject $probeAcl
+          if ($collector -eq $worker.SID) { throw 'Identity separation failed' }
+          $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
+          $stdout = Join-Path $root 'worker.stdout'
+          $stderr = Join-Path $root 'worker.stderr'
+          $argsForWorker = '-NoProfile -NonInteractive -File "{0}" -Root "{1}" -ExpectedSid "{2}"' -f $probe,$root,$worker.SID.Value
+          $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -ArgumentList $argsForWorker -Credential $cred -UseNewEnvironment -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
+          Get-Content -LiteralPath $stdout
+          if ($process.ExitCode -ne 0) { Get-Content -LiteralPath $stderr; throw 'Worker access verification failed' }
+          node $fixture restore $root
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic WAL restore failed' }
+          $after = @($targets | Get-FileHash)
+          if (Compare-Object $before $after -Property Path,Hash) { throw 'Protected files changed' }
+          Write-Output "Collector token: $($collector.Value); protected file hashes unchanged"
+          $after | Select-Object Path,Hash | ConvertTo-Json -Compress
