@@ -258,7 +258,7 @@ jobs:
           const path = require('node:path');
           const { execFileSync } = require('node:child_process');
           const { DatabaseSync } = require('node:sqlite');
-          const [inbox, marker, expectedUser, expectedSid] = process.argv.slice(2);
+          const [inbox, marker, expectedUser, expectedSid, tag] = process.argv.slice(2);
           assert.equal(os.userInfo().username.toLowerCase(), expectedUser.toLowerCase());
           assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
           const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
@@ -267,29 +267,111 @@ jobs:
           const groups = execFileSync(whoami,['/groups','/fo','csv','/nh'],{encoding:'utf8'});
           assert(!groups.includes('S-1-5-32-544'));
           assert.throws(() => { const fd = fs.openSync(marker,'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
-          const db = new DatabaseSync(path.join(inbox,'live.db'));
-          try {
-            db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'checkpointed'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'wal-only');");
-            for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(path.join(inbox,'live.db'+suffix),path.join(inbox,'fixture.db'+suffix),fs.constants.COPYFILE_EXCL);
-          } finally { db.close(); }
-          console.log('Worker SID '+expectedSid+' captured candidate before closing SQLite; protected marker open denied');
+          function runFixture(mode) {
+            const runId = tag + '-' + mode;
+            const root = path.join(inbox, 'f387-id88-' + runId);
+            fs.mkdirSync(root);
+            const priorTemp = process.env.TEMP;
+            process.env.TEMP = root;
+            try {
+              const canonical = fs.realpathSync(root);
+              assert.equal(fs.realpathSync(os.tmpdir()), canonical);
+              const dir = fs.mkdtempSync(path.join(canonical, 'db-v090-lift-'));
+              const name = path.basename(dir);
+              assert(/^db-v090-lift-[A-Za-z0-9]+$/.test(name));
+              assert.equal(path.dirname(fs.realpathSync(dir)), canonical);
+              const dbPath = path.join(dir, 'conversations.db');
+              fs.writeFileSync(path.join(canonical, 'worker-handoff.json'), JSON.stringify({ version:1, runId, directory:name, fixture:'conversations.db' }), {flag:'wx'});
+              fs.writeFileSync(path.join(dir, 'cleanup.marker'), 'synthetic '+runId, {flag:'wx'});
+              let db;
+              let initFailure = false;
+              let finallyPreserved = false;
+              let hookPreserved = false;
+              function openFixture() {
+                const pending = new DatabaseSync(dbPath);
+                if (mode === 'partial') {
+                  try { pending.exec("CREATE TABLE partial(id INTEGER PRIMARY KEY); INSERT INTO partial VALUES(1);"); }
+                  finally { pending.close(); }
+                  throw Error('synthetic initialization before client assignment');
+                }
+                return pending;
+              }
+              try {
+                db = openFixture();
+                db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'checkpointed'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'wal-only');");
+                const candidate = path.join(dir, 'candidate');
+                fs.mkdirSync(candidate);
+                for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(dbPath+suffix,path.join(candidate,'conversations.db'+suffix),fs.constants.COPYFILE_EXCL);
+              } catch (error) {
+                if (mode !== 'partial' || db || error.message !== 'synthetic initialization before client assignment') throw error;
+                initFailure = true;
+              } finally {
+                if (db) db.close();
+                // Exercise the diagnostic finally route, which delegates rather than deleting.
+                assert(fs.statSync(dbPath).size > 0);
+                assert(fs.existsSync(path.join(dir, 'cleanup.marker')));
+                finallyPreserved = true;
+              }
+              // Exercise the outer hook with the diagnostic directory as its cleanup candidate.
+              const preserveAfterEach = value => path.basename(value).startsWith('db-v090-lift-');
+              if (!preserveAfterEach(dir)) throw Error('Outer cleanup did not preserve diagnostic directory');
+              hookPreserved = fs.statSync(dbPath).size > 0 && fs.existsSync(path.join(dir,'cleanup.marker'));
+              assert(hookPreserved);
+              assert.equal(initFailure, mode === 'partial');
+              return { mode, runId, directory:name, finallyPreserved, hookPreserved, initFailure };
+            } finally { process.env.TEMP = priorTemp; }
+          }
+          assert(/^[0-9]+-[0-9]+$/.test(tag));
+          const handoffs = ['success','partial'].map(runFixture);
+          fs.writeFileSync(path.join(inbox,'handoff-report.json'),JSON.stringify({tag,handoffs}),{flag:'wx'});
+          console.log('F387 registered before open; finally and afterEach preserved both fixtures; partial initialization failed before assignment');
           '@ | Set-Content -LiteralPath $script -Encoding utf8
           $scriptAcl = Get-Acl -LiteralPath $script
           $scriptAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
           Set-Acl -LiteralPath $script -AclObject $scriptAcl
           $nodeExe = (Get-Command node -CommandType Application).Source
           $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
-          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value
+          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value,$tag
           $stdout = Join-Path $root 'worker.log'
           $stderr = Join-Path $root 'worker.err'
           $process = Start-Process -FilePath $nodeExe -ArgumentList $workerArgs -Credential $cred -UseNewEnvironment -WorkingDirectory $inbox.FullName -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
           Get-Content -LiteralPath $stdout
           if ($process.ExitCode -ne 0) { Get-Content -LiteralPath $stderr; throw 'Worker failed' }
-          $names = 'fixture.db','fixture.db-wal','fixture.db-shm'
+          $names = 'conversations.db','conversations.db-wal','conversations.db-shm'
+          function PlainItem($path, $directory) {
+            $item = Get-Item -LiteralPath $path -Force
+            if ($item.PSIsContainer -ne $directory -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe handoff path' }
+            return $item
+          }
+          [void](PlainItem $inbox.FullName $true)
+          $handoffFile = PlainItem (Join-Path $inbox.FullName 'handoff-report.json') $false
+          if ($handoffFile.Length -gt 4096) { throw 'Handoff report exceeds limit' }
+          $report = Get-Content -LiteralPath $handoffFile.FullName -Raw | ConvertFrom-Json
+          if ($report.tag -cne $tag -or $report.handoffs.Count -ne 2) { throw 'Invalid worker report' }
+          $locations = @{}
+          foreach ($mode in 'success','partial') {
+            $runId = "$tag-$mode"
+            $entry = @($report.handoffs | Where-Object mode -ceq $mode)
+            if ($entry.Count -ne 1 -or $entry[0].runId -cne $runId -or -not $entry[0].finallyPreserved -or -not $entry[0].hookPreserved -or $entry[0].initFailure -ne ($mode -eq 'partial')) { throw 'Invalid cleanup proof' }
+            $registeredRoot = PlainItem (Join-Path $inbox.FullName "f387-id88-$runId") $true
+            $registrationFile = PlainItem (Join-Path $registeredRoot.FullName 'worker-handoff.json') $false
+            if ($registrationFile.Length -gt 1024) { throw 'Registration exceeds limit' }
+            $registration = Get-Content -LiteralPath $registrationFile.FullName -Raw | ConvertFrom-Json
+            if ($registration.version -ne 1 -or $registration.runId -cne $runId -or $registration.fixture -cne 'conversations.db' -or $registration.directory -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$' -or $registration.directory -cne $entry[0].directory) { throw 'Invalid registration' }
+            $locations[$mode] = (PlainItem (Join-Path $registeredRoot.FullName $registration.directory) $true).FullName
+            [void](PlainItem (Join-Path $locations[$mode] 'cleanup.marker') $false)
+          }
+          $candidate = PlainItem (Join-Path $locations.success 'candidate') $true
+          $sourceFiles = @{}
+          foreach ($name in $names) { $sourceFiles[$name] = Join-Path $candidate.FullName $name }
+          $sourceFiles['partial-conversations.db'] = Join-Path $locations.partial 'conversations.db'
+          $sourceFiles['partial-cleanup.marker'] = Join-Path $locations.partial 'cleanup.marker'
+          $sourceFiles['handoff-report.json'] = $handoffFile.FullName
+          $names = @($names + 'partial-conversations.db' + 'partial-cleanup.marker' + 'handoff-report.json')
           $held = @{}
           try {
             foreach ($name in $names) {
-              $source = Get-Item -LiteralPath (Join-Path $inbox.FullName $name)
+              $source = PlainItem $sourceFiles[$name] $false
               if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $source.Length -le 0) { throw 'Invalid source' }
               $held[$name] = [IO.File]::Open($source.FullName,'Open','Read','Read')
             }
@@ -315,9 +397,9 @@ jobs:
         with:
           name: wal-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.seal.outputs.sha }}
           path: |
-            ${{ steps.seal.outputs.sealed }}/fixture.db
-            ${{ steps.seal.outputs.sealed }}/fixture.db-wal
-            ${{ steps.seal.outputs.sealed }}/fixture.db-shm
+            ${{ steps.seal.outputs.sealed }}/conversations.db
+            ${{ steps.seal.outputs.sealed }}/conversations.db-wal
+            ${{ steps.seal.outputs.sealed }}/conversations.db-shm
             ${{ steps.seal.outputs.sealed }}/cleanup.marker
             ${{ steps.seal.outputs.sealed }}/manifest.json
           retention-days: 14
@@ -337,8 +419,23 @@ jobs:
           $expected = "wal-receipt-$tag-$env:SOURCE_ID-$env:MANIFEST_SHA"
           $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
           function Valid($item) { return $null -ne $item -and $item.name -ceq $expected -and -not $item.expired -and $item.size_in_bytes -gt 0 -and $item.digest -match '^sha256:[a-f0-9]{64}$' }
-          if ((Valid $null) -or (Valid @{name="$expected-wrong";expired=$false;size_in_bytes=100;digest=('sha256:' + '0'*64)}) -or -not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Missing or wrong receipt control failed' }
-          Write-Output 'Missing/wrong receipt gated; marker present'
+          function ReleaseMarker($item, $permitRemoval) {
+            if (-not (Valid $item)) { return $false }
+            if (-not $permitRemoval) { throw 'Negative control unexpectedly matched receipt' }
+            $localManifest = (Get-FileHash -LiteralPath (Join-Path $env:SEALED 'manifest.json')).Hash.ToLowerInvariant()
+            if ($localManifest -cne $env:MANIFEST_SHA) { throw 'Local manifest changed; marker retained' }
+            $manifest = Get-Content -LiteralPath (Join-Path $env:SEALED 'manifest.json') -Raw | ConvertFrom-Json
+            foreach ($file in $manifest.files) {
+              $hash = (Get-FileHash -LiteralPath (Join-Path $env:SEALED $file.name)).Hash.ToLowerInvariant()
+              if ($hash -cne $file.sha256) { throw 'Sealed file changed; marker retained' }
+            }
+            Remove-Item -LiteralPath $marker
+            if ((Test-Path -LiteralPath $marker) -or -not (Test-Path -LiteralPath (Join-Path $env:SEALED 'partial-cleanup.marker') -PathType Leaf)) { throw 'Cleanup marker disposition incorrect' }
+            return $true
+          }
+          $wrong = @{ name="$expected-wrong"; expired=$false; size_in_bytes=100; digest=('sha256:' + '0'*64) }
+          if ((ReleaseMarker $null $false) -or (ReleaseMarker $wrong $false) -or -not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Missing or wrong receipt control failed' }
+          Write-Output 'F387 cleanup gate rejected missing and wrong receipts; original marker preserved'
           $receipt = $null
           for ($i=0; $i -lt 16; $i++) {
             try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $receipt = @($published.artifacts | Where-Object { Valid $_ }) | Select-Object -First 1 } catch { Write-Output 'Receipt listing temporarily unavailable' }
@@ -346,16 +443,8 @@ jobs:
             Start-Sleep -Seconds 10
           }
           if (-not $receipt) { throw 'No matching remote receipt; marker preserved' }
-          $localManifest = (Get-FileHash -LiteralPath (Join-Path $env:SEALED 'manifest.json')).Hash.ToLowerInvariant()
-          if ($localManifest -cne $env:MANIFEST_SHA) { throw 'Local manifest changed; marker retained' }
-          $manifest = Get-Content -LiteralPath (Join-Path $env:SEALED 'manifest.json') -Raw | ConvertFrom-Json
-          foreach ($file in $manifest.files) {
-            $hash = (Get-FileHash -LiteralPath (Join-Path $env:SEALED $file.name)).Hash.ToLowerInvariant()
-            if ($hash -cne $file.sha256) { throw 'Sealed file changed; marker retained' }
-          }
-          Remove-Item -LiteralPath $marker
-          if (Test-Path -LiteralPath $marker) { throw 'Marker still exists' }
-          Write-Output "Receipt artifact $($receipt.id) confirmed; original synthetic marker removed; archived files retained"
+          if (-not (ReleaseMarker $receipt $true)) { throw 'Receipt rejected; original marker preserved' }
+          Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
     if: github.repository == 'seanchc418/desktop-assistant'
@@ -400,7 +489,7 @@ jobs:
           if ($env:SOURCE_ID -notmatch '^\d+$' -or (Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
           $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           if ($doc.tag -cne $tag -or $doc.collectorSid -ceq $doc.workerSid) { throw 'Manifest identity or run mismatch' }
-          $names = @('fixture.db','fixture.db-wal','fixture.db-shm','cleanup.marker')
+          $names = @('conversations.db','conversations.db-wal','conversations.db-shm','cleanup.marker')
           if (@(Compare-Object @($names | Sort-Object) @($doc.files.name | Sort-Object) -CaseSensitive).Count) { throw 'Manifest inventory mismatch' }
           function VerifySet($directory) {
             foreach ($file in $doc.files) {
@@ -410,7 +499,7 @@ jobs:
           }
           VerifySet $download
           $negative = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "wal-negative-$tag")
-          foreach ($name in ($names | Where-Object { $_ -ne 'fixture.db-wal' })) { Copy-Item -LiteralPath (Join-Path $download $name) -Destination $negative.FullName }
+          foreach ($name in ($names | Where-Object { $_ -ne 'conversations.db-wal' })) { Copy-Item -LiteralPath (Join-Path $download $name) -Destination $negative.FullName }
           $missingRejected = $false
           try { VerifySet $negative.FullName } catch { $missingRejected = $_.CategoryInfo.Category -eq 'ObjectNotFound' }
           if (-not $missingRejected) { throw 'Missing WAL case failed' }
@@ -426,8 +515,8 @@ jobs:
           const source = process.argv[2];
           function check(includeWal, expected) {
             const root = fs.mkdtempSync(path.join(os.tmpdir(),'f386-restore-'));
-            for (const file of includeWal ? ['fixture.db','fixture.db-wal','fixture.db-shm'] : ['fixture.db']) fs.copyFileSync(path.join(source,file),path.join(root,file),fs.constants.COPYFILE_EXCL);
-            const db = new DatabaseSync(path.join(root,'fixture.db'));
+            for (const file of includeWal ? ['conversations.db','conversations.db-wal','conversations.db-shm'] : ['conversations.db']) fs.copyFileSync(path.join(source,file),path.join(root,file),fs.constants.COPYFILE_EXCL);
+            const db = new DatabaseSync(path.join(root,'conversations.db'));
             try {
               const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
               const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name='synthetic'").get().sql;
