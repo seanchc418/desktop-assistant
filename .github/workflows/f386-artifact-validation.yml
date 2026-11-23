@@ -1,0 +1,72 @@
+name: F386 artifact transport validation
+on:
+  push:
+    branches: [audit/f386-artifact-validation]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: f386-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  F386_RUN: ${{ github.run_id }}.${{ github.run_attempt }}
+
+jobs:
+  upload:
+    if: github.repository == 'seanchc418/desktop-assistant'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    outputs:
+      manifest_sha256: ${{ steps.fixture.outputs.manifest_sha256 }}
+      artifact_id: ${{ steps.store.outputs.artifact-id }}
+      artifact_digest: ${{ steps.store.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Generate closed synthetic SQLite fixture
+        id: fixture
+        shell: pwsh
+        run: node .github/scripts/f386-fixture.cjs create "$env:RUNNER_TEMP/f386-upload-$env:F386_RUN"
+      - name: Upload only the two verified files
+        id: store
+        if: ${{ always() && steps.fixture.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: f386-${{ github.run_id }}-${{ github.run_attempt }}-windows-2022
+          path: |
+            ${{ runner.temp }}/f386-upload-${{ env.F386_RUN }}/fixture.db
+            ${{ runner.temp }}/f386-upload-${{ env.F386_RUN }}/manifest.json
+          include-hidden-files: false
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 14
+  verify:
+    needs: upload
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Confirm download and restore locations are unused
+        shell: pwsh
+        run: |
+          if ((Test-Path -LiteralPath "$env:RUNNER_TEMP/f386-download-$env:F386_RUN") -or
+              (Test-Path -LiteralPath "$env:RUNNER_TEMP/f386-restore-$env:F386_RUN")) { throw 'A verification directory already exists' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: f386-${{ github.run_id }}-${{ github.run_attempt }}-windows-2022
+          path: ${{ runner.temp }}/f386-download-${{ env.F386_RUN }}
+      - name: Verify manifest, database bytes and restored rows
+        env:
+          MANIFEST_SHA256: ${{ needs.upload.outputs.manifest_sha256 }}
+          ARTIFACT_ID: ${{ needs.upload.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.upload.outputs.artifact_digest }}
+        shell: pwsh
+        run: |
+          if ($env:ARTIFACT_ID -notmatch '^\d+$' -or $env:ARTIFACT_DIGEST -notmatch '^[0-9a-f]{64}$') { throw 'Missing artifact metadata' }
+          Write-Output "Artifact ID $env:ARTIFACT_ID SHA-256 $env:ARTIFACT_DIGEST"
+          node .github/scripts/f386-fixture.cjs verify "$env:RUNNER_TEMP/f386-download-$env:F386_RUN" "$env:RUNNER_TEMP/f386-restore-$env:F386_RUN" "$env:MANIFEST_SHA256"
