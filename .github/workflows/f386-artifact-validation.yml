@@ -1017,8 +1017,16 @@ jobs:
           } finally { db.close(); }
           '@ | Set-Content -LiteralPath $script -Encoding utf8
           node $script $dir
-          if (@($probe.observation).Count -ne 3 -or $probe.observation.probeError -or @($probe.observation | Where-Object { $_.name -ceq 'conversations.db' }).Count -ne 1) { throw 'Restored successfully; Win32 handle probe unavailable' }
-          $probeNames = @($probe.observation | Select-Object -ExpandProperty name | Sort-Object)
-          if (@(Compare-Object $probeNames @('conversations.db','conversations.db-shm','conversations.db-wal') -CaseSensitive).Count) { throw 'Probe file set mismatch' }
-          foreach ($row in $probe.observation) { if ($row.readWin32 -isnot [long] -and $row.readWin32 -isnot [int]) { throw 'Win32 read value missing' }; if ($row.deleteAccessWin32 -isnot [long] -and $row.deleteAccessWin32 -isnot [int]) { throw 'Win32 delete-access value missing' } }
+          $check = Join-Path $env:RUNNER_TEMP 'f387-win32-evidence.cjs'
+          @'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const probe = JSON.parse(fs.readFileSync(process.argv[2],'utf8').replace(/^\uFEFF/,''));
+          const rows = probe.observation;
+          assert(Array.isArray(rows) && rows.length === 3);
+          assert.deepEqual(rows.map(x=>x.name).sort(),['conversations.db','conversations.db-shm','conversations.db-wal']);
+          for (const row of rows) assert(Number.isInteger(row.readWin32) && Number.isInteger(row.deleteAccessWin32));
+          console.log('Verified preserved Win32 readings '+JSON.stringify(rows));
+          '@ | Set-Content -LiteralPath $check -Encoding utf8
+          node $check (Join-Path $dir 'pre-cleanup.json')
           Write-Output 'Verified original artifact only; no Vitest invocation'
