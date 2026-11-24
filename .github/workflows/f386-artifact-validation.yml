@@ -14,645 +14,17 @@ env:
   F386_RUN: ${{ github.run_id }}.${{ github.run_attempt }}
 
 jobs:
-  upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
-    runs-on: windows-2022
-    timeout-minutes: 10
-    outputs:
-      manifest_sha256: ${{ steps.fixture.outputs.manifest_sha256 }}
-      artifact_id: ${{ steps.store.outputs.artifact-id }}
-      artifact_digest: ${{ steps.store.outputs.artifact-digest }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Generate closed synthetic SQLite fixture
-        id: fixture
-        shell: pwsh
-        run: node .github/scripts/f386-fixture.cjs create "$env:RUNNER_TEMP/f386-upload-$env:F386_RUN"
-      - name: Upload only the two verified files
-        id: store
-        if: ${{ always() && steps.fixture.outcome == 'success' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: f386-${{ github.run_id }}-${{ github.run_attempt }}-windows-2022
-          path: |
-            ${{ runner.temp }}/f386-upload-${{ env.F386_RUN }}/fixture.db
-            ${{ runner.temp }}/f386-upload-${{ env.F386_RUN }}/manifest.json
-          include-hidden-files: false
-          if-no-files-found: error
-          overwrite: false
-          retention-days: 14
-  verify:
-    needs: upload
-    runs-on: windows-2022
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Confirm download and restore locations are unused
-        shell: pwsh
-        run: |
-          if ((Test-Path -LiteralPath "$env:RUNNER_TEMP/f386-download-$env:F386_RUN") -or
-              (Test-Path -LiteralPath "$env:RUNNER_TEMP/f386-restore-$env:F386_RUN")) { throw 'A verification directory already exists' }
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: f386-${{ github.run_id }}-${{ github.run_attempt }}-windows-2022
-          path: ${{ runner.temp }}/f386-download-${{ env.F386_RUN }}
-      - name: Verify manifest, database bytes and restored rows
-        env:
-          MANIFEST_SHA256: ${{ needs.upload.outputs.manifest_sha256 }}
-          ARTIFACT_ID: ${{ needs.upload.outputs.artifact_id }}
-          ARTIFACT_DIGEST: ${{ needs.upload.outputs.artifact_digest }}
-        shell: pwsh
-        run: |
-          if ($env:ARTIFACT_ID -notmatch '^\d+$' -or $env:ARTIFACT_DIGEST -notmatch '^[0-9a-f]{64}$') { throw 'Missing artifact metadata' }
-          Write-Output "Artifact ID $env:ARTIFACT_ID SHA-256 $env:ARTIFACT_DIGEST"
-          node .github/scripts/f386-fixture.cjs verify "$env:RUNNER_TEMP/f386-download-$env:F386_RUN" "$env:RUNNER_TEMP/f386-restore-$env:F386_RUN" "$env:MANIFEST_SHA256"
-
-
-  identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
-    runs-on: windows-2022
-    permissions: {}
-    timeout-minutes: 10
-    steps:
-      - name: Verify two Windows identities and protect the synthetic WAL snapshot
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $collector = [Security.Principal.WindowsIdentity]::GetCurrent().User
-          $account = 'f386-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
-          $generated = 'Az9!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-          $password = ConvertTo-SecureString $generated -AsPlainText -Force
-          Remove-Variable generated
-          $worker = New-LocalUser -Name $account -Password $password -Description 'Disposable F386 synthetic test worker'
-          $users = Get-LocalGroup -SID 'S-1-5-32-545'
-          if (-not (Get-LocalGroupMember -Group $users | Where-Object SID -eq $worker.SID)) {
-            Add-LocalGroupMember -Group $users -Member $worker
-          }
-          $root = Join-Path $env:SystemDrive ('/f386-canary-' + $env:GITHUB_RUN_ID + '-' + $env:GITHUB_RUN_ATTEMPT)
-          if (Test-Path -LiteralPath $root) { throw 'Canary path already exists' }
-          New-Item -ItemType Directory -Path $root | Out-Null
-          $acl = [Security.AccessControl.DirectorySecurity]::new()
-          $acl.SetOwner($collector)
-          $acl.SetAccessRuleProtection($true, $false)
-          foreach ($sid in @($collector, [Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
-          }
-          $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
-          Set-Acl -LiteralPath $root -AclObject $acl
-          foreach ($dir in 'working','frozen','sealed','restore','control') {
-            New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null
-          }
-          $control = Join-Path $root 'control/canary.bin'
-          Set-Content -LiteralPath $control -Value 'synthetic worker control'
-          $fileAcl = Get-Acl -LiteralPath $control
-          $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'Modify','Allow'))
-          Set-Acl -LiteralPath $control -AclObject $fileAcl
-          $controlDir = Join-Path $root 'control'
-          $fileAcl = Get-Acl -LiteralPath $controlDir
-          $fileAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
-          Set-Acl -LiteralPath $controlDir -AclObject $fileAcl
-          $fixture = Join-Path $root 'fixture.cjs'
-          @'
-          const fs = require('node:fs');
-          const path = require('node:path');
-          const assert = require('node:assert/strict');
-          const { DatabaseSync } = require('node:sqlite');
-          const { createHash } = require('node:crypto');
-          const [phase, root] = process.argv.slice(2);
-          const files = ['fixture.db','fixture.db-wal','fixture.db-shm'];
-          const copy = (from, to) => files.forEach(file => fs.copyFileSync(path.join(root,from,file),path.join(root,to,file),fs.constants.COPYFILE_EXCL));
-          if (phase === 'prepare') {
-            const db = new DatabaseSync(path.join(root,'working',files[0]));
-            try {
-              db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'synthetic-alpha'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'synthetic-beta');");
-              copy('working','frozen');
-              copy('frozen','sealed');
-            } finally { db.close(); }
-          } else {
-            assert.equal(phase,'restore');
-            copy('sealed','restore');
-            const db = new DatabaseSync(path.join(root,'restore',files[0]));
-            try {
-              const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
-              const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name='synthetic'").get().sql;
-              const rows = db.prepare('SELECT id,value FROM synthetic ORDER BY id').all().map(({id,value}) => [id,value]);
-              assert.equal(integrity,'ok');
-              assert.equal(schema,'CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
-              assert.deepEqual(rows,[[1,'synthetic-alpha'],[2,'synthetic-beta']]);
-              const logicalSha256 = createHash('sha256').update(JSON.stringify({schema,rows})).digest('hex');
-              console.log(JSON.stringify({integrity,schema,rowCount:rows.length,logicalSha256}));
-            } finally { db.close(); }
-          }
-          '@ | Set-Content -LiteralPath $fixture -Encoding utf8
-          node $fixture prepare $root
-          if ($LASTEXITCODE -ne 0) { throw 'Synthetic WAL generation failed' }
-          $targets = foreach ($dir in 'frozen','sealed') {
-            foreach ($name in 'fixture.db','fixture.db-wal','fixture.db-shm') { Join-Path $root "$dir/$name" }
-          }
-          $before = @($targets | Get-FileHash)
-          $probe = Join-Path $root 'probe.ps1'
-          @'
-          param([string]$Root,[string]$ExpectedSid)
-          $ErrorActionPreference = 'Stop'
-          try {
-            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-            $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-            if ($identity.User.Value -ne $ExpectedSid -or $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Unexpected worker token' }
-            Add-Type -TypeDefinition @"
-          using System;
-          using System.Runtime.InteropServices;
-          using Microsoft.Win32.SafeHandles;
-          public static class F386Access {
-            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-            private static extern SafeFileHandle CreateFile(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
-            public static int Probe(string p,uint a) {
-              using(var h=CreateFile(p,a,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
-                return h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
-              }
-            }
-          }
-          "@
-            function Check($Relative,$Mask,$Expected) {
-              $actual = [F386Access]::Probe((Join-Path $Root $Relative),$Mask)
-              if ($actual -ne $Expected) { throw "Unexpected Windows result $actual for $Relative mask $Mask (expected $Expected)" }
-              Write-Output "$Relative mask $Mask -> $actual"
-            }
-            Check 'control/canary.bin' 2 0
-            Check '.' 64 5
-            foreach ($dir in 'frozen','sealed') {
-              Check $dir 64 5
-              Check $dir 65536 5
-              foreach ($file in 'fixture.db','fixture.db-wal','fixture.db-shm') {
-                foreach ($right in 2,4,65536,262144,524288) { Check "$dir/$file" $right 5 }
-              }
-            }
-            Write-Output "Worker token verified: $($identity.User.Value); administrator=false"
-            exit 0
-          } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
-          '@ | Set-Content -LiteralPath $probe -Encoding utf8
-          $probeAcl = Get-Acl -LiteralPath $probe
-          $probeAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
-          Set-Acl -LiteralPath $probe -AclObject $probeAcl
-          if ($collector -eq $worker.SID) { throw 'Identity separation failed' }
-          $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
-          $stdout = Join-Path $root 'worker.stdout'
-          $stderr = Join-Path $root 'worker.stderr'
-          $argsForWorker = '-NoProfile -NonInteractive -File "{0}" -Root "{1}" -ExpectedSid "{2}"' -f $probe,$root,$worker.SID.Value
-          $process = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -ArgumentList $argsForWorker -Credential $cred -UseNewEnvironment -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
-          Get-Content -LiteralPath $stdout
-          if ($process.ExitCode -ne 0) { Get-Content -LiteralPath $stderr; throw 'Worker access verification failed' }
-          node $fixture restore $root
-          if ($LASTEXITCODE -ne 0) { throw 'Synthetic WAL restore failed' }
-          $after = @($targets | Get-FileHash)
-          if (Compare-Object $before $after -Property Path,Hash) { throw 'Protected files changed' }
-          Write-Output "Collector token: $($collector.Value); protected file hashes unchanged"
-          $after | Select-Object Path,Hash | ConvertTo-Json -Compress
-
-
-  wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
-    runs-on: windows-2022
-    permissions:
-      contents: read
-    timeout-minutes: 16
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: 91daf54c96935a8b69a84d4f364a831ccf120d61
-          path: f387-prisma-source
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: '24.22.3'
-          architecture: x64
-      - name: Install locked packages and generate Prisma Client only
-        shell: pwsh
-        working-directory: f387-prisma-source
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          if ((git rev-parse HEAD) -cne '91daf54c96935a8b69a84d4f364a831ccf120d61') { throw 'Unexpected source' }
-          $before = (Get-FileHash -LiteralPath 'package-lock.json').Hash
-          if ((node --version) -cne 'v24.22.3' -or (npx.cmd --yes npm@11.6.2 --version) -cne '11.6.2') { throw 'Unexpected toolchain' }
-          npx.cmd --yes npm@11.6.2 ci --ignore-scripts --no-audit --no-fund
-          node node_modules/prisma/build/index.js generate --schema prisma/schema.prisma
-          if (-not (Test-Path -LiteralPath 'src/generated/prisma/client.ts' -PathType Leaf) -or (Get-FileHash -LiteralPath 'package-lock.json').Hash -cne $before) { throw 'Generated client missing or lockfile changed' }
-          Write-Output "F387 setup Node v24.22.3 npm 11.6.2 lockfile SHA-256 $before"
-      - name: Worker writes WAL, collector freezes and seals synthetic files
-        id: seal
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $collector = [Security.Principal.WindowsIdentity]::GetCurrent().User
-          $account = 'f386-' + [guid]::NewGuid().ToString('N').Substring(0,12)
-          $password = ConvertTo-SecureString ('Az9!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))) -AsPlainText -Force
-          $worker = New-LocalUser -Name $account -Password $password -Description 'Disposable synthetic WAL writer'
-          $users = Get-LocalGroup -SID 'S-1-5-32-545'
-          if (-not (Get-LocalGroupMember -Group $users | Where-Object SID -eq $worker.SID)) { Add-LocalGroupMember -Group $users -Member $worker }
-          if ($collector -eq $worker.SID) { throw 'Identity collision' }
-          $root = Join-Path $env:SystemDrive "/f386-chain-$tag"
-          if (Test-Path -LiteralPath $root) { throw 'Workspace already exists' }
-          New-Item -ItemType Directory -Path $root | Out-Null
-          $acl = [Security.AccessControl.DirectorySecurity]::new()
-          $acl.SetOwner($collector)
-          $acl.SetAccessRuleProtection($true,$false)
-          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
-            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
-          }
-          $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
-          Set-Acl -LiteralPath $root -AclObject $acl
-          $repo = Join-Path $env:GITHUB_WORKSPACE 'f387-prisma-source'
-          $repoAcl = [Security.AccessControl.DirectorySecurity]::new()
-          $repoAcl.SetOwner($collector)
-          $repoAcl.SetAccessRuleProtection($true,$false)
-          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
-            $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
-          }
-          $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
-          Set-Acl -LiteralPath $repo -AclObject $repoAcl
-          $inbox = New-Item -ItemType Directory -Path (Join-Path $root 'inbox')
-          $sealed = New-Item -ItemType Directory -Path (Join-Path $root 'sealed')
-          $inboxAcl = Get-Acl -LiteralPath $inbox.FullName
-          $inboxAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'Modify','ContainerInherit,ObjectInherit','None','Allow'))
-          Set-Acl -LiteralPath $inbox.FullName -AclObject $inboxAcl
-          $marker = Join-Path $sealed.FullName 'cleanup.marker'
-          Set-Content -LiteralPath $marker -Value ([guid]::NewGuid().ToString('N')) -NoNewline
-          $script = Join-Path $root 'producer.cjs'
-          @'
-          const assert = require('node:assert/strict');
-          const fs = require('node:fs');
-          const os = require('node:os');
-          const path = require('node:path');
-          const { execFileSync } = require('node:child_process');
-          const { DatabaseSync } = require('node:sqlite');
-          const [inbox, marker, expectedUser, expectedSid, tag, repo] = process.argv.slice(2);
-          assert.equal(os.userInfo().username.toLowerCase(), expectedUser.toLowerCase());
-          assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
-          const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
-          const sid = execFileSync(whoami,['/user','/fo','csv','/nh'],{encoding:'utf8'});
-          assert(sid.includes(expectedSid));
-          const groups = execFileSync(whoami,['/groups','/fo','csv','/nh'],{encoding:'utf8'});
-          assert(!groups.includes('S-1-5-32-544'));
-          assert.throws(() => { const fd = fs.openSync(marker,'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
-          assert.throws(() => { const fd = fs.openSync(path.join(repo,'package-lock.json'),'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
-          const Module = require('node:module');
-          const { pathToFileURL } = require('node:url');
-          const fromRepo = Module.createRequire(path.join(repo,'package.json'));
-          const generated = path.join(repo,'src/generated/prisma');
-          const ts = fromRepo('typescript');
-          const oldTs = Module._extensions['.ts'];
-          Module._extensions['.ts'] = (mod, filename) => {
-            const relative = path.relative(generated,filename);
-            assert(relative && !path.isAbsolute(relative) && !relative.startsWith('..'));
-            const result = ts.transpileModule(fs.readFileSync(filename,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}});
-            mod._compile(result.outputText,filename);
-          };
-          let PrismaClient;
-          try { ({ PrismaClient } = fromRepo(path.join(generated,'client.ts'))); }
-          finally { if (oldTs) Module._extensions['.ts']=oldTs; else delete Module._extensions['.ts']; }
-          const { PrismaLibSql } = fromRepo('@prisma/adapter-libsql');
-          const adapterPackage = path.join(repo,'node_modules/@prisma/adapter-libsql/package.json');
-          const clientPackage = path.join(path.dirname(adapterPackage),'node_modules/@libsql/client/package.json');
-          const resolvedClient = Module.createRequire(adapterPackage).resolve('@libsql/client');
-          const version = filename => JSON.parse(fs.readFileSync(filename,'utf8')).version;
-          assert.equal(version(adapterPackage),'7.10.0');
-          assert.equal(version(path.join(repo,'node_modules/@prisma/client/package.json')),'7.10.0');
-          assert.equal(version(clientPackage),'0.17.4');
-          assert(resolvedClient.startsWith(path.dirname(clientPackage)+path.sep));
-          assert.equal(version(path.join(repo,'node_modules/@libsql/win32-x64-msvc/package.json')),'0.5.29');
-          console.log('F387 locked adapter 7.10.0, nested client 0.17.4, Windows native 0.5.29; worker source write denied');
-          async function runFixture(mode) {
-            const runId = tag + '-' + mode;
-            const root = path.join(inbox, 'f387-id88-' + runId);
-            fs.mkdirSync(root);
-            const priorTemp = process.env.TEMP;
-            process.env.TEMP = root;
-            try {
-              const canonical = fs.realpathSync(root);
-              assert.equal(fs.realpathSync(os.tmpdir()), canonical);
-              const dir = fs.mkdtempSync(path.join(canonical, 'db-v090-lift-'));
-              const name = path.basename(dir);
-              assert(/^db-v090-lift-[A-Za-z0-9]+$/.test(name));
-              assert.equal(path.dirname(fs.realpathSync(dir)), canonical);
-              const dbPath = path.join(dir, 'conversations.db');
-              fs.writeFileSync(path.join(canonical, 'worker-handoff.json'), JSON.stringify({ version:1, runId, directory:name, fixture:'conversations.db' }), {flag:'wx'});
-              fs.writeFileSync(path.join(dir, 'cleanup.marker'), 'synthetic '+runId, {flag:'wx'});
-              let db;
-              let initFailure = false;
-              let finallyPreserved = false;
-              let hookPreserved = false;
-              async function openFixture() {
-                const pending = new PrismaClient({ adapter:new PrismaLibSql({url:pathToFileURL(dbPath).href}) });
-                try {
-                  await pending.$connect();
-                  if (mode === 'partial') {
-                    await pending.$executeRawUnsafe('CREATE TABLE partial(id INTEGER PRIMARY KEY)');
-                    await pending.$executeRawUnsafe('INSERT INTO partial VALUES(1)');
-                    throw Error('synthetic initialization before client assignment');
-                  }
-                  return pending;
-                } catch (error) { await pending.$disconnect(); throw error; }
-              }
-              try {
-                db = await openFixture();
-                const engine = (await db.$queryRawUnsafe('SELECT sqlite_version() AS version'))[0].version;
-                console.log('F387 generated Prisma Client connected to native SQLite '+engine);
-                await db.$queryRawUnsafe('PRAGMA journal_mode=WAL');
-                await db.$queryRawUnsafe('PRAGMA wal_autocheckpoint=0');
-                await db.$executeRawUnsafe('CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
-                await db.$executeRawUnsafe("INSERT INTO synthetic VALUES(1,'checkpointed')");
-                await db.$queryRawUnsafe('PRAGMA wal_checkpoint(TRUNCATE)');
-                await db.$executeRawUnsafe("INSERT INTO synthetic VALUES(2,'wal-only')");
-                assert.equal((await db.$queryRawUnsafe('SELECT id FROM synthetic ORDER BY id')).length,2);
-                const candidate = path.join(dir, 'candidate');
-                fs.mkdirSync(candidate);
-                for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(dbPath+suffix,path.join(candidate,'conversations.db'+suffix),fs.constants.COPYFILE_EXCL);
-              } catch (error) {
-                if (mode !== 'partial' || db || error.message !== 'synthetic initialization before client assignment') throw error;
-                initFailure = true;
-              } finally {
-                if (db) await db.$disconnect();
-                // Exercise the diagnostic finally route, which delegates rather than deleting.
-                assert(fs.statSync(dbPath).size > 0);
-                assert(fs.existsSync(path.join(dir, 'cleanup.marker')));
-                finallyPreserved = true;
-              }
-              // Exercise the outer hook with the diagnostic directory as its cleanup candidate.
-              const preserveAfterEach = value => path.basename(value).startsWith('db-v090-lift-');
-              if (!preserveAfterEach(dir)) throw Error('Outer cleanup did not preserve diagnostic directory');
-              hookPreserved = fs.statSync(dbPath).size > 0 && fs.existsSync(path.join(dir,'cleanup.marker'));
-              assert(hookPreserved);
-              assert.equal(initFailure, mode === 'partial');
-              return { mode, runId, directory:name, finallyPreserved, hookPreserved, initFailure };
-            } finally { process.env.TEMP = priorTemp; }
-          }
-          assert(/^[0-9]+-[0-9]+$/.test(tag));
-          (async () => {
-            const handoffs = [await runFixture('success'),await runFixture('partial')];
-            fs.writeFileSync(path.join(inbox,'handoff-report.json'),JSON.stringify({tag,handoffs}),{flag:'wx'});
-            console.log('F387 Prisma registered before open; finally and afterEach preserved both fixtures; partial initialization failed before assignment');
-          })().catch(error => { console.error(error); process.exitCode=1; });
-          '@ | Set-Content -LiteralPath $script -Encoding utf8
-          $scriptAcl = Get-Acl -LiteralPath $script
-          $scriptAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
-          Set-Acl -LiteralPath $script -AclObject $scriptAcl
-          $nodeExe = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
-          if ((& $nodeExe --version) -cne 'v24.22.3') { throw 'Worker executable version mismatch' }
-          $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
-          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}" "{5}" "{6}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value,$tag,$repo
-          $stdout = Join-Path $root 'worker.log'
-          $stderr = Join-Path $root 'worker.err'
-          $process = Start-Process -FilePath $nodeExe -ArgumentList $workerArgs -Credential $cred -UseNewEnvironment -WorkingDirectory $inbox.FullName -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
-          Get-Content -LiteralPath $stdout
-          if ($process.ExitCode -ne 0) { Get-Content -LiteralPath $stderr; throw 'Worker failed' }
-          $names = 'conversations.db','conversations.db-wal','conversations.db-shm'
-          function PlainItem($path, $directory) {
-            $item = Get-Item -LiteralPath $path -Force
-            if ($item.PSIsContainer -ne $directory -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsafe handoff path' }
-            return $item
-          }
-          [void](PlainItem $inbox.FullName $true)
-          $handoffFile = PlainItem (Join-Path $inbox.FullName 'handoff-report.json') $false
-          if ($handoffFile.Length -gt 4096) { throw 'Handoff report exceeds limit' }
-          $report = Get-Content -LiteralPath $handoffFile.FullName -Raw | ConvertFrom-Json
-          if ($report.tag -cne $tag -or $report.handoffs.Count -ne 2) { throw 'Invalid worker report' }
-          $locations = @{}
-          foreach ($mode in 'success','partial') {
-            $runId = "$tag-$mode"
-            $entry = @($report.handoffs | Where-Object mode -ceq $mode)
-            if ($entry.Count -ne 1 -or $entry[0].runId -cne $runId -or -not $entry[0].finallyPreserved -or -not $entry[0].hookPreserved -or $entry[0].initFailure -ne ($mode -eq 'partial')) { throw 'Invalid cleanup proof' }
-            $registeredRoot = PlainItem (Join-Path $inbox.FullName "f387-id88-$runId") $true
-            $registrationFile = PlainItem (Join-Path $registeredRoot.FullName 'worker-handoff.json') $false
-            if ($registrationFile.Length -gt 1024) { throw 'Registration exceeds limit' }
-            $registration = Get-Content -LiteralPath $registrationFile.FullName -Raw | ConvertFrom-Json
-            if ($registration.version -ne 1 -or $registration.runId -cne $runId -or $registration.fixture -cne 'conversations.db' -or $registration.directory -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$' -or $registration.directory -cne $entry[0].directory) { throw 'Invalid registration' }
-            $locations[$mode] = (PlainItem (Join-Path $registeredRoot.FullName $registration.directory) $true).FullName
-            [void](PlainItem (Join-Path $locations[$mode] 'cleanup.marker') $false)
-          }
-          $candidate = PlainItem (Join-Path $locations.success 'candidate') $true
-          $sourceFiles = @{}
-          foreach ($name in $names) { $sourceFiles[$name] = Join-Path $candidate.FullName $name }
-          $sourceFiles['partial-conversations.db'] = Join-Path $locations.partial 'conversations.db'
-          $sourceFiles['partial-cleanup.marker'] = Join-Path $locations.partial 'cleanup.marker'
-          $sourceFiles['handoff-report.json'] = $handoffFile.FullName
-          $names = @($names + 'partial-conversations.db' + 'partial-cleanup.marker' + 'handoff-report.json')
-          $held = @{}
-          try {
-            foreach ($name in $names) {
-              $source = PlainItem $sourceFiles[$name] $false
-              if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $source.Length -le 0) { throw 'Invalid source' }
-              $held[$name] = [IO.File]::Open($source.FullName,'Open','Read','Read')
-            }
-            foreach ($name in $names) {
-              $destination = [IO.File]::Open((Join-Path $sealed.FullName $name),'CreateNew','Write','None')
-              try { $held[$name].CopyTo($destination) } finally { $destination.Dispose() }
-            }
-          } finally { foreach ($stream in $held.Values) { $stream.Dispose() } }
-          $items = foreach ($name in ($names + 'cleanup.marker')) {
-            $file = Get-Item -LiteralPath (Join-Path $sealed.FullName $name)
-            [ordered]@{ name=$name; bytes=$file.Length; sha256=(Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant() }
-          }
-          $manifest = Join-Path $sealed.FullName 'manifest.json'
-          [ordered]@{ tag=$tag; collectorSid=$collector.Value; workerSid=$worker.SID.Value; files=@($items) } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest -Encoding utf8
-          $hash = (Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant()
-          Write-Output "Collector SID $($collector.Value); source handles excluded writers and deleters during sealing; manifest SHA-256 $hash"
-          "sealed=$($sealed.FullName)" >> $env:GITHUB_OUTPUT
-          "sha=$hash" >> $env:GITHUB_OUTPUT
-      - name: Publish sealed WAL source and marker
-        id: archive
-        if: ${{ always() && steps.seal.outcome == 'success' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: wal-source-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.seal.outputs.sha }}
-          path: |
-            ${{ steps.seal.outputs.sealed }}/conversations.db
-            ${{ steps.seal.outputs.sealed }}/conversations.db-wal
-            ${{ steps.seal.outputs.sealed }}/conversations.db-shm
-            ${{ steps.seal.outputs.sealed }}/partial-conversations.db
-            ${{ steps.seal.outputs.sealed }}/partial-cleanup.marker
-            ${{ steps.seal.outputs.sealed }}/handoff-report.json
-            ${{ steps.seal.outputs.sealed }}/cleanup.marker
-            ${{ steps.seal.outputs.sealed }}/manifest.json
-          retention-days: 14
-          if-no-files-found: error
-          overwrite: false
-          include-hidden-files: false
-      - name: Wait for the other runner's exact receipt before removing the original marker
-        shell: pwsh
-        env:
-          SOURCE_ID: ${{ steps.archive.outputs.artifact-id }}
-          MANIFEST_SHA: ${{ steps.seal.outputs.sha }}
-          SEALED: ${{ steps.seal.outputs.sealed }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $marker = Join-Path $env:SEALED 'cleanup.marker'
-          $expected = "wal-receipt-$tag-$env:SOURCE_ID-$env:MANIFEST_SHA"
-          $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
-          function Valid($item) { return $null -ne $item -and $item.name -ceq $expected -and -not $item.expired -and $item.size_in_bytes -gt 0 -and $item.digest -match '^sha256:[a-f0-9]{64}$' }
-          function ReleaseMarker($item, $permitRemoval) {
-            if (-not (Valid $item)) { return $false }
-            if (-not $permitRemoval) { throw 'Negative control unexpectedly matched receipt' }
-            $localManifest = (Get-FileHash -LiteralPath (Join-Path $env:SEALED 'manifest.json')).Hash.ToLowerInvariant()
-            if ($localManifest -cne $env:MANIFEST_SHA) { throw 'Local manifest changed; marker retained' }
-            $manifest = Get-Content -LiteralPath (Join-Path $env:SEALED 'manifest.json') -Raw | ConvertFrom-Json
-            foreach ($file in $manifest.files) {
-              $hash = (Get-FileHash -LiteralPath (Join-Path $env:SEALED $file.name)).Hash.ToLowerInvariant()
-              if ($hash -cne $file.sha256) { throw 'Sealed file changed; marker retained' }
-            }
-            Remove-Item -LiteralPath $marker
-            if ((Test-Path -LiteralPath $marker) -or -not (Test-Path -LiteralPath (Join-Path $env:SEALED 'partial-cleanup.marker') -PathType Leaf)) { throw 'Cleanup marker disposition incorrect' }
-            return $true
-          }
-          $wrong = @{ name="$expected-wrong"; expired=$false; size_in_bytes=100; digest=('sha256:' + '0'*64) }
-          if ((ReleaseMarker $null $false) -or (ReleaseMarker $wrong $false) -or -not (Test-Path -LiteralPath $marker -PathType Leaf)) { throw 'Missing or wrong receipt control failed' }
-          Write-Output 'F387 cleanup gate rejected missing and wrong receipts; original marker preserved'
-          $receipt = $null
-          for ($i=0; $i -lt 16; $i++) {
-            try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $receipt = @($published.artifacts | Where-Object { Valid $_ }) | Select-Object -First 1 } catch { Write-Output 'Receipt listing temporarily unavailable' }
-            if ($receipt) { break }
-            Start-Sleep -Seconds 10
-          }
-          if (-not $receipt) { throw 'No matching remote receipt; marker preserved' }
-          if (-not (ReleaseMarker $receipt $true)) { throw 'Receipt rejected; original marker preserved' }
-          Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
-
-  wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
-    runs-on: windows-2022
-    permissions: {}
-    timeout-minutes: 14
-    steps:
-      - name: Wait for this run's sealed source
-        id: locate
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $pattern = '^wal-source-' + [regex]::Escape($tag) + '-([0-9a-f]{64})$'
-          $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
-          $source = $null
-          for ($i=0; $i -lt 50; $i++) {
-            try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $source = $published.artifacts | Where-Object { $_.name -cmatch $pattern -and -not $_.expired -and $_.size_in_bytes -gt 0 } | Select-Object -First 1 } catch { Write-Output 'Source listing temporarily unavailable' }
-            if ($source) { break }
-            Start-Sleep -Seconds 10
-          }
-          if (-not $source -or $source.name -cnotmatch $pattern) { throw 'No sealed source' }
-          "name=$($source.name)" >> $env:GITHUB_OUTPUT
-          "id=$($source.id)" >> $env:GITHUB_OUTPUT
-          "sha=$($Matches[1])" >> $env:GITHUB_OUTPUT
-      - name: Download the sealed source into an empty location
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: ${{ steps.locate.outputs.name }}
-          path: ${{ runner.temp }}/wal-source-${{ env.F386_RUN }}
-      - name: Verify all bytes, restore WAL and confirm the WAL-dependent row
-        id: check
-        shell: pwsh
-        env:
-          SOURCE_ID: ${{ steps.locate.outputs.id }}
-          MANIFEST_SHA: ${{ steps.locate.outputs.sha }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $download = Join-Path $env:RUNNER_TEMP "wal-source-$env:F386_RUN"
-          $manifest = Join-Path $download 'manifest.json'
-          if ($env:SOURCE_ID -notmatch '^\d+$' -or (Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
-          $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-          if ($doc.tag -cne $tag -or $doc.collectorSid -ceq $doc.workerSid) { throw 'Manifest identity or run mismatch' }
-          $names = @('conversations.db','conversations.db-wal','conversations.db-shm','partial-conversations.db','partial-cleanup.marker','handoff-report.json','cleanup.marker')
-          if (@(Compare-Object @($names | Sort-Object) @($doc.files.name | Sort-Object) -CaseSensitive).Count) { throw 'Manifest inventory mismatch' }
-          function VerifySet($directory) {
-            foreach ($file in $doc.files) {
-              $item = Get-Item -LiteralPath (Join-Path $directory $file.name)
-              if ($item.PSIsContainer -or $item.Length -ne $file.bytes -or (Get-FileHash -LiteralPath $item.FullName).Hash -ine $file.sha256) { throw 'File integrity mismatch' }
-            }
-          }
-          VerifySet $download
-          $expectedArchive = @($names + 'manifest.json' | Sort-Object)
-          if (@(Compare-Object $expectedArchive @(Get-ChildItem -LiteralPath $download -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Downloaded file inventory mismatch' }
-          $handoff = Get-Content -LiteralPath (Join-Path $download 'handoff-report.json') -Raw | ConvertFrom-Json
-          if ($handoff.tag -cne $tag -or $handoff.handoffs.Count -ne 2) { throw 'Downloaded handoff mismatch' }
-          foreach ($mode in 'success','partial') {
-            $entry = @($handoff.handoffs | Where-Object mode -ceq $mode)
-            if ($entry.Count -ne 1 -or $entry[0].runId -cne "$tag-$mode" -or -not $entry[0].finallyPreserved -or -not $entry[0].hookPreserved -or $entry[0].initFailure -ne ($mode -eq 'partial')) { throw 'Downloaded handoff proof mismatch' }
-          }
-          $negative = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "wal-negative-$tag")
-          foreach ($name in ($names | Where-Object { $_ -ne 'conversations.db-wal' })) { Copy-Item -LiteralPath (Join-Path $download $name) -Destination $negative.FullName }
-          $missingRejected = $false
-          try { VerifySet $negative.FullName } catch { $missingRejected = $_.CategoryInfo.Category -eq 'ObjectNotFound' }
-          if (-not $missingRejected -or -not (Test-Path -LiteralPath (Join-Path $negative.FullName 'cleanup.marker') -PathType Leaf)) { throw 'Missing WAL case failed' }
-          Write-Output 'F387 missing WAL rejected; negative fixture marker preserved'
-          $checkScript = Join-Path $env:RUNNER_TEMP "wal-check-$tag.cjs"
-          @'
-          const fs = require('node:fs');
-          const os = require('node:os');
-          const path = require('node:path');
-          const assert = require('node:assert/strict');
-          const { DatabaseSync } = require('node:sqlite');
-          const { createHash } = require('node:crypto');
-          const source = process.argv[2];
-          function check(includeWal, expected) {
-            const root = fs.mkdtempSync(path.join(os.tmpdir(),'f386-restore-'));
-            for (const file of includeWal ? ['conversations.db','conversations.db-wal','conversations.db-shm'] : ['conversations.db']) fs.copyFileSync(path.join(source,file),path.join(root,file),fs.constants.COPYFILE_EXCL);
-            const db = new DatabaseSync(path.join(root,'conversations.db'));
-            try {
-              const integrity = db.prepare('PRAGMA integrity_check').get().integrity_check;
-              const schema = db.prepare("SELECT sql FROM sqlite_schema WHERE name='synthetic'").get().sql;
-              const rows = db.prepare('SELECT id,value FROM synthetic ORDER BY id').all().map(({id,value})=>[id,value]);
-              assert.equal(integrity,'ok');
-              assert.equal(schema,'CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
-              assert.deepEqual(rows,expected);
-              return {integrity, schema, rows, logicalSha256:createHash('sha256').update(JSON.stringify({schema,rows})).digest('hex')};
-            } finally { db.close(); }
-          }
-          const dbOnly = check(false,[[1,'checkpointed']]);
-          const restored = check(true,[[1,'checkpointed'],[2,'wal-only']]);
-          const partial = new DatabaseSync(path.join(source,'partial-conversations.db'),{readOnly:true});
-          try {
-            assert.equal(partial.prepare('PRAGMA integrity_check').get().integrity_check,'ok');
-            assert.equal(partial.prepare('SELECT id FROM partial').get().id,1);
-            assert(fs.statSync(path.join(source,'partial-cleanup.marker')).size > 0);
-          } finally { partial.close(); }
-          console.log(JSON.stringify({ dbOnly, restored, partialDatabaseAndMarkerPreserved:true }));
-          '@ | Set-Content -LiteralPath $checkScript -Encoding utf8
-          $result = node $checkScript $download
-          if ($LASTEXITCODE -ne 0) { throw 'SQLite verification failed' }
-          Write-Output $result
-          $receipt = Join-Path $env:RUNNER_TEMP "wal-receipt-$tag.json"
-          [ordered]@{ tag=$tag; artifactId=$env:SOURCE_ID; manifestSha256=$env:MANIFEST_SHA; restored=($result | ConvertFrom-Json) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $receipt -Encoding utf8
-          "file=$receipt" >> $env:GITHUB_OUTPUT
-      - name: Publish exact successful verification receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: wal-receipt-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.locate.outputs.id }}-${{ steps.locate.outputs.sha }}
-          path: ${{ steps.check.outputs.file }}
-          retention-days: 14
-          if-no-files-found: error
-          overwrite: false
-
   id88:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Resolve ID 88 cleanup with paired lifetime evidence' && github.run_attempt == 1
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Integrate approved ID 88 lifetime candidate once' && github.run_attempt == 1
     runs-on: windows-2022
     permissions:
       contents: read
     timeout-minutes: 16
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [wait, gc]
     env:
-      F387_GC_MODE: ${{ matrix.mode }}
+      F387_GC_MODE: candidate
     outputs:
       archive_id: ${{ steps.upload.outputs.artifact-id }}
       manifest_sha: ${{ steps.seal.outputs.manifest_sha }}
-      manifest_sha_wait: ${{ steps.seal.outputs.manifest_sha_wait }}
-      manifest_sha_gc: ${{ steps.seal.outputs.manifest_sha_gc }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -716,114 +88,20 @@ jobs:
           Set-Acl -LiteralPath $inbox.FullName -AclObject $inboxAcl
           $trial = New-Item -ItemType Directory -Path (Join-Path $inbox.FullName 'id88-trial')
           $runId = "$tag-id88"
-          $temp = New-Item -ItemType Directory -Path (Join-Path $trial.FullName "f387-id88-$runId")
+          $temp = New-Item -ItemType Directory -Path (Join-Path $trial.FullName "f387-cleanup-solution-$runId")
           $target = Join-Path $repo 'tests/database-migration.test.ts'
           $overlay = Join-Path $repo 'tests/f387-id88-handoff.mjs'
           $probe = Join-Path $repo 'tests/f387-id88-probe.ps1'
           $config = Join-Path $repo 'f387-id88.config.mjs'
           $launch = Join-Path $repo 'f387-id88-launch.cjs'
           $case = 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
-          $patcher = Join-Path $root 'instrument.cjs'
-          @'
-          const fs = require('node:fs');
-          const path = require('node:path');
-          const assert = require('node:assert/strict');
-          const repo = process.argv[2];
-          const replace = (file,from,to) => {
-            const text=fs.readFileSync(file,'utf8').replaceAll('\r\n','\n');
-            assert.equal(text.split(from).length,2,'Instrumentation anchor mismatch');
-            fs.writeFileSync(file,text.replace(from,()=>to));
-          };
-          const helper = String.raw`
-          const fsTrace = require('node:fs');
-          const pathTrace = require('node:path');
-          function life(event,data={}) {
-            const root=process.env.F387_DIAGNOSTIC_ROOT;
-            if(root) fsTrace.appendFileSync(pathTrace.join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),hr:process.hrtime.bigint().toString(),pid:process.pid,event,...data})+'\n');
-          }
-          const dbids=new WeakMap(); let dbnext=0; let stmtnext=0;
-          const totals=new Map();
-          const watch=new FinalizationRegistry(data=>{totals.get(data.dbid).finalized++;life('statement.wrapper-finalized',data);});
-          const dbid=db=>{let id=dbids.get(db);if(!id){id=++dbnext;dbids.set(db,id);totals.set(id,{prepared:0,finalized:0});life('database.wrapper-observed',{dbid:id});}return id;};
-          const oldPrepare=Database.prototype.prepare;
-          Database.prototype.prepare=function(...args){const id=dbid(this);const stmt=oldPrepare.apply(this,args);const sid=++stmtnext;totals.get(id).prepared++;watch.register(stmt,{dbid:id,sid});life('statement.prepared',{dbid:id,sid});return stmt;};
-          const oldClose=Database.prototype.close;
-          Database.prototype.close=function(...args){const id=dbid(this);life('native.close.begin',{dbid:id,...totals.get(id)});try{const result=oldClose.apply(this,args);life('native.close.return',{dbid:id,...totals.get(id)});return result;}catch(error){life('native.close.error',{dbid:id,error:String(error)});throw error;}};
-          life('libsql.module.loaded');
-          `;
-          fs.appendFileSync(path.join(repo,'node_modules/libsql/index.js'),helper);
-          const open=path.join(repo,'src/main/db/open.ts');
-          replace(open,'  await prisma.$connect();',String.raw`  const trace = (event: string) => { const root=process.env.F387_DIAGNOSTIC_ROOT; if(root) require('node:fs').appendFileSync(require('node:path').join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),pid:process.pid,event})+'\n'); };
-            const disconnect=prisma.$disconnect.bind(prisma);
-            prisma.$disconnect=async () => { trace('prisma.disconnect.begin'); try { await disconnect(); trace('prisma.disconnect.resolved'); } catch(error){trace('prisma.disconnect.error');throw error;} };
-            trace('prisma.connect.begin');
-            await prisma.$connect();
-            trace('prisma.connect.resolved');`);
-          '@ | Set-Content -LiteralPath $patcher -Encoding utf8
-          $nodePatch = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
-          & $nodePatch $patcher $repo
-          if ($LASTEXITCODE -ne 0) { throw 'Instrumentation source mismatch' }
-          $original = (Get-Content -LiteralPath $target -Raw).Replace([string][char]13,'')
-          $caseMatch = "  it('$case', async () => {"
-          $nextMatch = "  it('lifts an unstamped pre-plan-36"
-          $i = $original.IndexOf($caseMatch,[StringComparison]::Ordinal)
-          $j = $original.IndexOf($nextMatch,$i+1,[StringComparison]::Ordinal)
-          if ($i -lt 0 -or $j -le $i -or $original.LastIndexOf($caseMatch) -ne $i -or $original -match '\b(it|test|describe)\.only\(') { throw 'ID 88 source did not match expected anchors' }
-          $targetBody = $original.Substring($i,$j-$i)
-          $assignment = "    dir = legacyDir;" + [char]10
-          $remove = '      await rm(legacyDir, { recursive: true, force: true });'
-          if (-not $targetBody.Contains($assignment) -or -not $targetBody.Contains($remove)) { throw 'ID 88 cleanup anchors not found' }
-          $targetBody = $targetBody.Replace($caseMatch,"  it.only('$case', async () => {").Replace($assignment,"    registerDiagnostic(legacyDir);" + [char]10).Replace($remove,'      await observeAndPreserve(legacyDir);')
-          if ($targetBody -match '\brm\(' -or $targetBody -match '\bdir\s*=\s*legacyDir' -or $targetBody.IndexOf('registerDiagnostic') -ge $targetBody.IndexOf('await openDatabase')) { throw 'Unsafe focused overlay' }
-          $prefix = $original.Substring(0,$i)
-          $hookOriginal = '      await rm(dir, { recursive: true, force: true });'
-          if (-not $prefix.Contains($hookOriginal)) { throw 'Outer cleanup anchor missing' }
-          $prefix = $prefix.Replace($hookOriginal,'      if (!isProtected(dir)) await rm(dir, { recursive: true, force: true });')
-          $import = "import { registerDiagnostic, isProtected, observeAndPreserve } from './f387-id88-handoff.mjs';"
-          Set-Content -LiteralPath $target -Value ($import + [char]10 + $prefix + $targetBody + $original.Substring($j)) -Encoding utf8
-          @'
-          import assert from 'node:assert/strict';
-          import fs from 'node:fs';
-          import path from 'node:path';
-          import { tmpdir } from 'node:os';
-          import { execFileSync } from 'node:child_process';
-          import { fileURLToPath } from 'node:url';
-          export function isProtected(dir) { return /^db-v090-lift-[A-Za-z0-9]+$/.test(path.basename(dir)); }
-          export function registerDiagnostic(dir) {
-            const root = fs.realpathSync(tmpdir());
-            const runId = process.env.F387_RUN_ID;
-            assert.equal(root,fs.realpathSync(process.env.F387_DIAGNOSTIC_ROOT));
-            assert.match(runId,/^[0-9]+-1-id88$/);
-            assert.equal(path.basename(root),'f387-id88-'+runId);
-            assert.equal(path.dirname(fs.realpathSync(dir)),root);
-            assert(isProtected(dir));
-            fs.writeFileSync(path.join(root,'worker-handoff.json'),JSON.stringify({runId,dir:path.basename(dir),registeredAt:new Date().toISOString(),pid:process.pid}),{flag:'wx'});
-          }
-          export async function observeAndPreserve(dir) {
-            const startedAt = new Date().toISOString();
-            let observation;
-            try {
-              assert(isProtected(dir));
-              const shell = path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
-              const probe = fileURLToPath(new URL('./f387-id88-probe.ps1',import.meta.url));
-              observation = JSON.parse(execFileSync(shell,['-NoProfile','-NonInteractive','-File',probe,dir],{encoding:'utf8',windowsHide:true}));
-            } catch (error) { observation = { probeError:String(error.message) }; }
-            fs.writeFileSync(path.join(tmpdir(),'pre-cleanup.json'),JSON.stringify({startedAt,observedAt:new Date().toISOString(),pid:process.pid,recursiveRemovalSuppressed:true,observation}),{flag:'wx'});
-            const trace=path.join(tmpdir(),'lifecycle.jsonl');
-            fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event:'cleanup.probe.complete'})+'\n');
-            assert.equal(typeof globalThis.gc,'function','GC must be explicitly exposed in this diagnostic worker');
-            const emit=(event,data={})=>fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event,...data})+'\n');
-            assert(['wait','gc'].includes(process.env.F387_GC_MODE));
-            emit('intervention.begin',{mode:process.env.F387_GC_MODE});
-            if(process.env.F387_GC_MODE==='gc') globalThis.gc();
-            await new Promise(resolve=>setTimeout(resolve,100));
-            emit('gc.intervention.yielded');
-            const shell = path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
-            const probe = fileURLToPath(new URL('./f387-id88-probe.ps1',import.meta.url));
-            const afterGc=JSON.parse(execFileSync(shell,['-NoProfile','-NonInteractive','-File',probe,dir],{encoding:'utf8',windowsHide:true}));
-            emit('gc.probe.complete',{observation:afterGc});
-          }
-          '@ | Set-Content -LiteralPath $overlay -Encoding utf8
+          $patch = Join-Path $root 'candidate.patch'
+          [IO.File]::WriteAllBytes($patch,[Convert]::FromBase64String('ZGlmZiAtLWdpdCBhL2RvY3MvZGV2L2lkODgtaXNvbGF0ZWQtY2xlYW51cC5tZCBiL2RvY3MvZGV2L2lkODgtaXNvbGF0ZWQtY2xlYW51cC5tZApuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi4zZmVlNWMxCi0tLSAvZGV2L251bGwKKysrIGIvZG9jcy9kZXYvaWQ4OC1pc29sYXRlZC1jbGVhbnVwLm1kCkBAIC0wLDAgKzEsMTcgQEAKKyMgSUQgODggaXNvbGF0ZWQgY2xlYW51cCBjYW5kaWRhdGUKKworU3RhdHVzOiByZXZpZXdhYmxlIHNjcmF0Y2ggcGF0Y2g7IG5vdCBhcHBsaWVkIHRvIHRoZSBwcm90ZWN0ZWQgcmVwb3NpdG9yaWVzIG9yIFBSMjIuCisKK1RoZSBzZWxlY3RlZCBsZWdhY3kgbWlncmF0aW9uIGNhc2UgcmV0YWlucyBpdHMgc3ludGhldGljIGRpcmVjdG9yeSBpbiB0aGUgd29ya2VyLiBUaGUgc3VwZXJ2aXNvciB3YWl0cyBmb3IgbmF0dXJhbCBwcm9jZXNzIGNsb3NlLCBjb3BpZXMgdGhlIGZpbmFsIGRhdGFiYXNlIGludG8gc2VhbGVkIGV2aWRlbmNlLCB2YWxpZGF0ZXMgYSBzZXBhcmF0ZSByZXN0b3JlLCBhbmQgcmVxdWlyZXMgdHJ1c3RlZCB1cGxvYWQvZG93bmxvYWQgdmVyaWZpY2F0aW9uIGJlZm9yZSBjbGVhbnVwIGNhbiBiZWNvbWUgZWxpZ2libGUuIENsZWFudXAgaXMgb3B0LWluLCByZXN0cmljdGVkIHRvIHRoZSBleGFjdCBzeW50aGV0aWMgZGlyZWN0b3J5IGFuZCBkYXRhYmFzZSBmaWxlbmFtZXMsIGFuZCByZWNoZWNrcyBoYXNoZXMuIEZhaWx1cmVzIHByZXNlcnZlIGFsbCBldmlkZW5jZS4KKworVGhpcyBhZGRyZXNzZXMgdGVzdCBjbGVhbnVwIG9yZGVyaW5nLiBJdCBkb2VzIG5vdCBmaXggbGlic3FsIG5hdGl2ZSBzdGF0ZW1lbnQgbGlmZWN5Y2xlLCBwcm92ZSB0aGUgaGlzdG9yaWNhbCByZWN1cnNpdmUgY2xlYW51cCBwYXNzZXMsIG9yIGF1dGhvcml6ZSBHVUkgYWNjZXB0YW5jZS4gTm8gZm9yY2VkIEdDLCBzbGVlcHMsIHN3YWxsb3dlZCBFQlVTWSwgcGFja2FnZSB1cGdyYWRlLCBvciBuYXRpdmUgYmluYXJ5IHBhdGNoIGlzIHBhcnQgb2YgdGhlIGNhbmRpZGF0ZS4KKworVGhlIE5vZGUgc3VwZXJ2aXNvciBpcyBhIHByb2Nlc3MtbGlmZXRpbWUgYWRhcHRlciwgbm90IGEgV2luZG93cyBwcmluY2lwYWwvQUNMIGJvdW5kYXJ5LiBQcm9kdWN0aW9uIGludGVncmF0aW9uIG11c3QgY29ubmVjdCBpdCB0byB0aGUgcHJldmlvdXNseSB2ZXJpZmllZCByZXN0cmljdGVkIHdvcmtlciAvIGNvbGxlY3RvciBpZGVudGl0aWVzIG9uIGEgZGlzcG9zYWJsZSBydW5uZXIuIFRoZSBhY2tub3dsZWRnZW1lbnQgY2FsbGJhY2sgaXMgdHJ1c3RlZCBjb2xsZWN0b3IgY29kZTsgYm9vbGVhbiBmaWVsZHMgYWxvbmUgYXJlIG5vdCBzZXJ2aWNlIGF1dGhlbnRpY2F0aW9uLiBBbiBhY3R1YWwgR2l0SHViIGFydGlmYWN0IGRvd25sb2FkIGFuZCBpbmRlcGVuZGVudCByZXN0b3JlIG11c3Qgc3VwcGx5IGl0LgorCitUaGUgaXNvbGF0ZWQgcGF0aCB1c2VzIHRoZSBzdXBlcnZpc29yIHdpdGggdGhlIGV4aXN0aW5nIGNvbnRyb2xsZWQgVml0ZXN0IGNvbmZpZ3VyYXRpb24uIEl0cyBoZWxwZXIgY2hlY2tzIHRoZSBpc29sYXRlZCBURU1QL3Jvb3QgYmVmb3JlIHJlZ2lzdGVyaW5nIHRoZSBmaXh0dXJlLiBPcmRpbmFyeSBydW5zIHdpdGhvdXQgRjM4N19JU09MQVRFRF9ST09UIGtlZXAgdGhlaXIgb3JpZ2luYWwgYmVoYXZpb3IuIFRoZSBjYXNlIHJlbWFpbnMgYSBub3JtYWwgdGVzdCAobm8gaXQub25seSk7IHRoZSBzdXBlcnZpc29yIHVzZXMgdGhlIGV4YWN0IGhpc3RvcmljYWwgbmFtZSBmaWx0ZXIgYW5kIG5vIHJldHJpZXMuIE90aGVyIHRlc3RzIHJlbWFpbiB1bmNoYW5nZWQuCisKK1ZlcmlmaWNhdGlvbiBwZXJmb3JtZWQ6IGZvdXIgc3RhbmRhbG9uZSBzeW50aGV0aWMgU1FMaXRlL3Byb2Nlc3MgY2hlY2tzLCBvcmlnaW5hbCBzb3VyY2UgYW5jaG9yIGNoZWNrcywgYW5kIHN5bnRheCBjaGVja3MuIE5vIG5ldyBJRDg4LCByZXBvc2l0b3J5IHJlZ3Jlc3Npb24sIHJlbW90ZSB1cGxvYWQsIGNsZWFudXAgYXBwbGljYXRpb24sIG9yIFdpbmRvd3MgQUNMIHZhbGlkYXRpb24gaGFzIGJlZW4gcnVuIGZvciB0aGlzIGNhbmRpZGF0ZS4KKworTmF0aXZlIGZpeCBkaXJlY3Rpb246IGxpYnNxbC1qcyBQUjIxNCAob3BlbiBhdCByZXZpZXcgdGltZSkgcHJvcG9zZXMgZXhwbGljaXQgc3RhdGVtZW50IGNsb3NlIGFuZCBjb25uZWN0aW9uLW93bmVkIHN0YXRlbWVudCBsaWZlY3ljbGUgbWFuYWdlbWVudC4gVGhlIGluc3RhbGxlZCAwLjUuMjkgU3RhdGVtZW50IGV4cG9zZXMgbm8gZXhwbGljaXQgY2xvc2UgbWV0aG9kOyB0aGUgbG9ja2VkIEBsaWJzcWwvY2xpZW50IDAuMTcuNCBleGVjdXRlU3RtdCBwYXRoIHByZXBhcmVzIHdpdGhvdXQgZXhwbGljaXQgZmluYWxpemF0aW9uLiBEbyBub3QgYWRvcHQgYW4gdW5tZXJnZWQgbmF0aXZlIHBhdGNoIG9yIHByZS1yZWxlYXNlIHdpdGhvdXQgYSBzZXBhcmF0ZSBXaW5kb3dzIGNvbXBhdGliaWxpdHkvYnVpbGQgcmV2aWV3LgorCitTb3VyY2VzOiBodHRwczovL2dpdGh1Yi5jb20vdHVyc29kYXRhYmFzZS9saWJzcWwtanMvaXNzdWVzLzIyOCA7IGh0dHBzOi8vZ2l0aHViLmNvbS90dXJzb2RhdGFiYXNlL2xpYnNxbC1qcy9wdWxsLzIxNCA7IGh0dHBzOi8vc3FsaXRlLm9yZy9jM3JlZi9jbG9zZS5odG1sCmRpZmYgLS1naXQgYS9zY3JpcHRzL3J1bi1pZDg4LWlzb2xhdGVkLmNqcyBiL3NjcmlwdHMvcnVuLWlkODgtaXNvbGF0ZWQuY2pzCm5ldyBmaWxlIG1vZGUgMTAwNjQ0CmluZGV4IDAwMDAwMDAuLmM2YWUwYjQKLS0tIC9kZXYvbnVsbAorKysgYi9zY3JpcHRzL3J1bi1pZDg4LWlzb2xhdGVkLmNqcwpAQCAtMCwwICsxLDcwIEBACitjb25zdCBmcyA9IHJlcXVpcmUoJ25vZGU6ZnMvcHJvbWlzZXMnKTsKK2NvbnN0IHBhdGggPSByZXF1aXJlKCdub2RlOnBhdGgnKTsKK2NvbnN0IG9zID0gcmVxdWlyZSgnbm9kZTpvcycpOworY29uc3QgYXNzZXJ0ID0gcmVxdWlyZSgnbm9kZTphc3NlcnQvc3RyaWN0Jyk7Citjb25zdCB7IHNwYXduIH0gPSByZXF1aXJlKCdub2RlOmNoaWxkX3Byb2Nlc3MnKTsKK2NvbnN0IHsgRGF0YWJhc2VTeW5jIH0gPSByZXF1aXJlKCdub2RlOnNxbGl0ZScpOworY29uc3QgeyBvYnNlcnZlV29ya2VyLCBwcmVzZXJ2ZUFmdGVyV29ya2VyIH0gPSByZXF1aXJlKCcuL3dvcmtlci1ldmlkZW5jZS1ib3VuZGFyeS5janMnKTsKKworY29uc3QgcGF0dGVybiA9ICdzY2hlbWEgYm9vdCBhZnRlciB0aGUgcGxhbi0zNiBmbGF0dGVuID4gbGlmdHMgYSB2MFxcLjlcXC4wIHByb2ZpbGUgXFwobm8gaGVhZFxcKSB0byB0aGUgc2NoZW1hIGhlYWQgYW5kIGtlZXBzIGl0cyBkYXRhJCc7CisKK2FzeW5jIGZ1bmN0aW9uIHJ1bklkODhJc29sYXRlZCh7IHJlcG8sIGNvbmZpZ0ZpbGUsIGFja25vd2xlZGdlQXJ0aWZhY3QsIGFsbG93U3ludGhldGljRGVsZXRpb24gPSBmYWxzZSB9KSB7CisgIGlmICh0eXBlb2YgYWNrbm93bGVkZ2VBcnRpZmFjdCAhPT0gJ2Z1bmN0aW9uJykgdGhyb3cgbmV3IEVycm9yKCdTdXBwbHkgYSB0cnVzdGVkIHJlbW90ZSBkb3dubG9hZC1hbmQtcmVzdG9yZSBhY2tub3dsZWRnZW1lbnQgaGFuZGxlciBiZWZvcmUgbGF1bmNoaW5nJyk7CisgIGlmICghcGF0aC5pc0Fic29sdXRlKHJlcG8pIHx8ICFwYXRoLmlzQWJzb2x1dGUoY29uZmlnRmlsZSkpIHRocm93IG5ldyBFcnJvcignQWJzb2x1dGUgc2NyYXRjaCBhbmQgY29udHJvbCBwYXRocyByZXF1aXJlZCcpOworICBpZiAoL25ldXJvbmVjdGlvbi1mMig/Oi1iYXNlbGluZSk/KD86W1xcL118JCkvaS50ZXN0KHJlcG8pKSB0aHJvdyBuZXcgRXJyb3IoJ1Byb3RlY3RlZCBvcmlnaW5hbCByZXBvc2l0b3J5Jyk7CisgIGNvbnN0IHJvb3QgPSBhd2FpdCBmcy5ta2R0ZW1wKHBhdGguam9pbihvcy50bXBkaXIoKSwgJ2YzODctY2xlYW51cC1zb2x1dGlvbi0nKSk7CisgIGNvbnN0IG91dHB1dCA9IHBhdGguam9pbihyb290LCAncmVzdWx0Lmpzb24nKTsKKyAgY29uc3Qgc3Rkb3V0ID0gYXdhaXQgZnMub3BlbihwYXRoLmpvaW4ocm9vdCwgJ3dvcmtlci5zdGRvdXQudHh0JyksICd3eCcpOworICBjb25zdCBzdGRlcnIgPSBhd2FpdCBmcy5vcGVuKHBhdGguam9pbihyb290LCAnd29ya2VyLnN0ZGVyci50eHQnKSwgJ3d4Jyk7CisgIGxldCBjaGlsZDsKKyAgbGV0IHdvcmtlckNsb3NlZDsKKyAgdHJ5IHsKKyAgICBjaGlsZCA9IHNwYXduKHByb2Nlc3MuZXhlY1BhdGgsIFtwYXRoLmpvaW4ocmVwbywgJ25vZGVfbW9kdWxlcy92aXRlc3Qvdml0ZXN0Lm1qcycpLCAncnVuJywgJ3Rlc3RzL2RhdGFiYXNlLW1pZ3JhdGlvbi50ZXN0LnRzJywgJy0tY29uZmlnJywgY29uZmlnRmlsZSwgJy0tY29uZmlnTG9hZGVyJywgJ3J1bm5lcicsICctLXRlc3ROYW1lUGF0dGVybicsIHBhdHRlcm4sICctLW1heFdvcmtlcnMnLCAnMScsICctLW5vLWZpbGUtcGFyYWxsZWxpc20nLCAnLS1uby1jYWNoZScsICctLXJlcG9ydGVyJywgJ3ZlcmJvc2UnLCAnLS1yZXBvcnRlcicsICdqc29uJywgJy0tb3V0cHV0RmlsZS5qc29uJywgb3V0cHV0XSwgeworICAgICAgY3dkOiByZXBvLAorICAgICAgZW52OiB7IC4uLnByb2Nlc3MuZW52LCBURU1QOiByb290LCBUTVA6IHJvb3QsIFRNUERJUjogcm9vdCwgRjM4N19JU09MQVRFRF9ST09UOiByb290IH0sCisgICAgICBzdGRpbzogWydpZ25vcmUnLCBzdGRvdXQuZmQsIHN0ZGVyci5mZF0sCisgICAgICB3aW5kb3dzSGlkZTogdHJ1ZSwKKyAgICB9KTsKKyAgICB3b3JrZXJDbG9zZWQgPSBvYnNlcnZlV29ya2VyKGNoaWxkKTsKKyAgfSBmaW5hbGx5IHsKKyAgICBhd2FpdCBzdGRvdXQuY2xvc2UoKTsKKyAgICBhd2FpdCBzdGRlcnIuY2xvc2UoKTsKKyAgfQorICBjb25zdCBjbG9zZWQgPSBhd2FpdCB3b3JrZXJDbG9zZWQ7CisgIGNvbnN0IGhhbmRvZmYgPSBKU09OLnBhcnNlKGF3YWl0IGZzLnJlYWRGaWxlKHBhdGguam9pbihyb290LCAnZml4dHVyZS1oYW5kb2ZmLmpzb24nKSwgJ3V0ZjgnKSk7CisgIGlmICghTnVtYmVyLmlzSW50ZWdlcihoYW5kb2ZmLnBpZCkgfHwgIS9eZGItdjA5MC1saWZ0LVtBLVphLXowLTldKyQvLnRlc3QoaGFuZG9mZi5kaXJlY3RvcnkpKSB0aHJvdyBuZXcgRXJyb3IoJ0ludmFsaWQgd29ya2VyIGhhbmRvZmY7IHJldGFpbiBzZXNzaW9uJyk7CisgIGNvbnN0IGZpeHR1cmVEaXJlY3RvcnkgPSBwYXRoLmpvaW4ocm9vdCwgaGFuZG9mZi5kaXJlY3RvcnkpOworICBjb25zdCBib3VuZGFyeSA9IGF3YWl0IHByZXNlcnZlQWZ0ZXJXb3JrZXIoeworICAgIHdvcmtlckNsb3NlZDogUHJvbWlzZS5yZXNvbHZlKGNsb3NlZCksCisgICAgc2Vzc2lvblJvb3Q6IHJvb3QsCisgICAgZml4dHVyZURpcmVjdG9yeSwKKyAgICBldmlkZW5jZURpcmVjdG9yeTogcGF0aC5qb2luKHJvb3QsICdzZWFsZWQnKSwKKyAgICB2YWxpZGF0ZVNuYXBzaG90OiBhc3luYyAoeyBldmlkZW5jZURpcmVjdG9yeSB9KSA9PiB7CisgICAgICBjb25zdCByZXN0b3JlID0gcGF0aC5qb2luKHJvb3QsICdyZXN0b3JlJyk7CisgICAgICBhd2FpdCBmcy5ta2RpcihyZXN0b3JlKTsKKyAgICAgIGZvciAoY29uc3QgZmlsZSBvZiBbJ2NvbnZlcnNhdGlvbnMuZGInLCAnY29udmVyc2F0aW9ucy5kYi13YWwnLCAnY29udmVyc2F0aW9ucy5kYi1zaG0nXSkgeworICAgICAgICB0cnkgeyBhd2FpdCBmcy5jb3B5RmlsZShwYXRoLmpvaW4oZXZpZGVuY2VEaXJlY3RvcnksIGZpbGUpLCBwYXRoLmpvaW4ocmVzdG9yZSwgZmlsZSksIGZzLmNvbnN0YW50cy5DT1BZRklMRV9FWENMKTsgfQorICAgICAgICBjYXRjaCAoZXJyb3IpIHsgaWYgKGVycm9yLmNvZGUgIT09ICdFTk9FTlQnIHx8IGZpbGUgPT09ICdjb252ZXJzYXRpb25zLmRiJykgdGhyb3cgZXJyb3I7IH0KKyAgICAgIH0KKyAgICAgIGNvbnN0IGRiID0gbmV3IERhdGFiYXNlU3luYyhwYXRoLmpvaW4ocmVzdG9yZSwgJ2NvbnZlcnNhdGlvbnMuZGInKSk7CisgICAgICB0cnkgeworICAgICAgICBhc3NlcnQuZXF1YWwoZGIucHJlcGFyZSgnUFJBR01BIGludGVncml0eV9jaGVjaycpLmdldCgpLmludGVncml0eV9jaGVjaywgJ29rJyk7CisgICAgICAgIGFzc2VydC5lcXVhbChkYi5wcmVwYXJlKCdQUkFHTUEgdXNlcl92ZXJzaW9uJykuZ2V0KCkudXNlcl92ZXJzaW9uLCA3KTsKKyAgICAgICAgYXNzZXJ0LmRlZXBFcXVhbChkYi5wcmVwYXJlKCdTRUxFQ1QgaWQsdGl0bGUsYWN0aXZlUm9vdElkIEZST00gQ29udmVyc2F0aW9uIE9SREVSIEJZIGlkJykuYWxsKCkubWFwKHJvdyA9PiAoeyAuLi5yb3cgfSkpLCBbeyBpZDogJ2NvbnYtbGVnYWN5JywgdGl0bGU6ICdCZWZvcmUgdGhlIGhlYWQnLCBhY3RpdmVSb290SWQ6IG51bGwgfV0pOworICAgICAgICBhc3NlcnQuZGVlcEVxdWFsKGRiLnByZXBhcmUoJ1NFTEVDVCBpZCxjb250ZW50LHBhcmVudElkLGFjdGl2ZUNoaWxkSWQgRlJPTSBNZXNzYWdlIE9SREVSIEJZIGlkJykuYWxsKCkubWFwKHJvdyA9PiAoeyAuLi5yb3cgfSkpLCBbeyBpZDogJ21zZy1sZWdhY3knLCBjb250ZW50OiAnS2VwdCBhY3Jvc3MgdGhlIGxpZnQnLCBwYXJlbnRJZDogbnVsbCwgYWN0aXZlQ2hpbGRJZDogbnVsbCB9XSk7CisgICAgICB9IGZpbmFsbHkgeyBkYi5jbG9zZSgpOyB9CisgICAgICBjb25zdCByZXN1bHQgPSBKU09OLnBhcnNlKGF3YWl0IGZzLnJlYWRGaWxlKG91dHB1dCwgJ3V0ZjgnKSk7CisgICAgICBhc3NlcnQuZXF1YWwocmVzdWx0Lm51bVBhc3NlZFRlc3RzLCAxKTsKKyAgICAgIGFzc2VydC5lcXVhbChyZXN1bHQubnVtRmFpbGVkVGVzdHMsIDApOworICAgICAgY29uc3QgZXhlY3V0ZWQgPSByZXN1bHQudGVzdFJlc3VsdHMuZmxhdE1hcChmaWxlID0+IGZpbGUuYXNzZXJ0aW9uUmVzdWx0cykuZmlsdGVyKHRlc3QgPT4gWydwYXNzZWQnLCAnZmFpbGVkJ10uaW5jbHVkZXModGVzdC5zdGF0dXMpKTsKKyAgICAgIGFzc2VydC5lcXVhbChleGVjdXRlZC5sZW5ndGgsIDEpOworICAgICAgYXNzZXJ0LmVxdWFsKGV4ZWN1dGVkWzBdLnRpdGxlLCAnbGlmdHMgYSB2MC45LjAgcHJvZmlsZSAobm8gaGVhZCkgdG8gdGhlIHNjaGVtYSBoZWFkIGFuZCBrZWVwcyBpdHMgZGF0YScpOworICAgICAgcmV0dXJuIHsgaW50ZWdyaXR5OiAnb2snLCBzY2hlbWFBbmRSb3dzVmVyaWZpZWQ6IHRydWUgfTsKKyAgICB9LAorICAgIGFja25vd2xlZGdlQXJ0aWZhY3QsCisgIH0pOworICBpZiAoYWxsb3dTeW50aGV0aWNEZWxldGlvbikgYXdhaXQgYm91bmRhcnkucmVtb3ZlU3ludGhldGljRml4dHVyZSh7IGFsbG93U3ludGhldGljRGVsZXRpb246IHRydWUgfSk7CisgIHJldHVybiB7IHJvb3QsIGJvdW5kYXJ5LCBjbGVhbnVwQXBwbGllZDogYWxsb3dTeW50aGV0aWNEZWxldGlvbiB9OworfQorCittb2R1bGUuZXhwb3J0cyA9IHsgcnVuSWQ4OElzb2xhdGVkIH07CmRpZmYgLS1naXQgYS9zY3JpcHRzL3dvcmtlci1ldmlkZW5jZS1ib3VuZGFyeS5janMgYi9zY3JpcHRzL3dvcmtlci1ldmlkZW5jZS1ib3VuZGFyeS5janMKbmV3IGZpbGUgbW9kZSAxMDA2NDQKaW5kZXggMDAwMDAwMC4uZjVhYzAyMAotLS0gL2Rldi9udWxsCisrKyBiL3NjcmlwdHMvd29ya2VyLWV2aWRlbmNlLWJvdW5kYXJ5LmNqcwpAQCAtMCwwICsxLDk3IEBACitjb25zdCBmcyA9IHJlcXVpcmUoJ25vZGU6ZnMvcHJvbWlzZXMnKTsKK2NvbnN0IHBhdGggPSByZXF1aXJlKCdub2RlOnBhdGgnKTsKK2NvbnN0IGNyeXB0byA9IHJlcXVpcmUoJ25vZGU6Y3J5cHRvJyk7Citjb25zdCB7IG9uY2UgfSA9IHJlcXVpcmUoJ25vZGU6ZXZlbnRzJyk7CisKK2NvbnN0IGRpZ2VzdCA9IGJ5dGVzID0+IGNyeXB0by5jcmVhdGVIYXNoKCdzaGEyNTYnKS51cGRhdGUoYnl0ZXMpLmRpZ2VzdCgnaGV4Jyk7Citjb25zdCBhbGxvd2VkTmFtZXMgPSBuZXcgU2V0KFsnY29udmVyc2F0aW9ucy5kYicsICdjb252ZXJzYXRpb25zLmRiLXdhbCcsICdjb252ZXJzYXRpb25zLmRiLXNobSddKTsKKworYXN5bmMgZnVuY3Rpb24gY2hlY2tlZERpcmVjdG9yeShkaXJlY3RvcnkpIHsKKyAgY29uc3QgYWJzb2x1dGUgPSBwYXRoLnJlc29sdmUoZGlyZWN0b3J5KTsKKyAgY29uc3Qgcm9vdCA9IHBhdGgucGFyc2UoYWJzb2x1dGUpLnJvb3Q7CisgIGxldCBjdXJyZW50ID0gcm9vdDsKKyAgZm9yIChjb25zdCBwYXJ0IG9mIGFic29sdXRlLnNsaWNlKHJvb3QubGVuZ3RoKS5zcGxpdChwYXRoLnNlcCkuZmlsdGVyKEJvb2xlYW4pKSB7CisgICAgY3VycmVudCA9IHBhdGguam9pbihjdXJyZW50LCBwYXJ0KTsKKyAgICBjb25zdCBzdGF0ID0gYXdhaXQgZnMubHN0YXQoY3VycmVudCk7CisgICAgaWYgKHN0YXQuaXNTeW1ib2xpY0xpbmsoKSB8fCAhc3RhdC5pc0RpcmVjdG9yeSgpKSB0aHJvdyBuZXcgRXJyb3IoJ0RpcmVjdG9yeSBvciBhbmNlc3RvciBpcyBhIGxpbmsgb3Igbm90IGEgZGlyZWN0b3J5Jyk7CisgIH0KKyAgaWYgKChhd2FpdCBmcy5yZWFscGF0aChhYnNvbHV0ZSkpLnRvTG93ZXJDYXNlKCkgIT09IGFic29sdXRlLnRvTG93ZXJDYXNlKCkpIHRocm93IG5ldyBFcnJvcignVW5leHBlY3RlZCBkaXJlY3RvcnkgcmVzb2x1dGlvbicpOworICByZXR1cm4gYWJzb2x1dGU7Cit9CisKK2FzeW5jIGZ1bmN0aW9uIGZpeHR1cmVJbnZlbnRvcnkoZGlyZWN0b3J5KSB7CisgIGNvbnN0IGVudHJpZXMgPSBhd2FpdCBmcy5yZWFkZGlyKGRpcmVjdG9yeSwgeyB3aXRoRmlsZVR5cGVzOiB0cnVlIH0pOworICBpZiAoIWVudHJpZXMuc29tZShlbnRyeSA9PiBlbnRyeS5uYW1lID09PSAnY29udmVyc2F0aW9ucy5kYicpKSB0aHJvdyBuZXcgRXJyb3IoJ1ByaW1hcnkgZGF0YWJhc2UgbWlzc2luZycpOworICBjb25zdCBmaWxlcyA9IFtdOworICBmb3IgKGNvbnN0IGVudHJ5IG9mIGVudHJpZXMuc29ydCgoYSwgYikgPT4gYS5uYW1lLmxvY2FsZUNvbXBhcmUoYi5uYW1lKSkpIHsKKyAgICBpZiAoIWFsbG93ZWROYW1lcy5oYXMoZW50cnkubmFtZSkgfHwgIWVudHJ5LmlzRmlsZSgpIHx8IGVudHJ5LmlzU3ltYm9saWNMaW5rKCkpIHRocm93IG5ldyBFcnJvcignVW5leHBlY3RlZCBmaXh0dXJlIGVudHJ5Jyk7CisgICAgY29uc3QgZmlsZSA9IHBhdGguam9pbihkaXJlY3RvcnksIGVudHJ5Lm5hbWUpOworICAgIGNvbnN0IGJlZm9yZSA9IGF3YWl0IGZzLmxzdGF0KGZpbGUpOworICAgIGlmICghYmVmb3JlLmlzRmlsZSgpIHx8IGJlZm9yZS5pc1N5bWJvbGljTGluaygpKSB0aHJvdyBuZXcgRXJyb3IoJ1Vuc2FmZSBmaXh0dXJlIGVudHJ5Jyk7CisgICAgY29uc3QgYnl0ZXMgPSBhd2FpdCBmcy5yZWFkRmlsZShmaWxlKTsKKyAgICBjb25zdCBhZnRlciA9IGF3YWl0IGZzLmxzdGF0KGZpbGUpOworICAgIGlmIChiZWZvcmUuc2l6ZSAhPT0gYWZ0ZXIuc2l6ZSB8fCBiZWZvcmUubXRpbWVNcyAhPT0gYWZ0ZXIubXRpbWVNcyB8fCBiZWZvcmUuaW5vICE9PSBhZnRlci5pbm8pIHRocm93IG5ldyBFcnJvcignRml4dHVyZSBjaGFuZ2VkIGR1cmluZyBpbnZlbnRvcnknKTsKKyAgICBmaWxlcy5wdXNoKHsgbmFtZTogZW50cnkubmFtZSwgYnl0ZXM6IGJ5dGVzLmxlbmd0aCwgc2hhMjU2OiBkaWdlc3QoYnl0ZXMpIH0pOworICB9CisgIHJldHVybiBmaWxlczsKK30KKworZnVuY3Rpb24gb2JzZXJ2ZVdvcmtlcihjaGlsZCkgeworICBpZiAoIWNoaWxkIHx8ICFOdW1iZXIuaXNJbnRlZ2VyKGNoaWxkLnBpZCkgfHwgY2hpbGQuZXhpdENvZGUgIT09IG51bGwgfHwgY2hpbGQuc2lnbmFsQ29kZSAhPT0gbnVsbCkgdGhyb3cgbmV3IEVycm9yKCdBdHRhY2ggb2JzZXJ2ZXIgaW1tZWRpYXRlbHkgYWZ0ZXIgc3Bhd25pbmcgYSBsaXZlIHdvcmtlcicpOworICByZXR1cm4gb25jZShjaGlsZCwgJ2Nsb3NlJykudGhlbigoW2V4aXRDb2RlLCBzaWduYWxdKSA9PiAoeyBwaWQ6IGNoaWxkLnBpZCwgZXhpdENvZGUsIHNpZ25hbCwgb2JzZXJ2ZWRBdDogbmV3IERhdGUoKS50b0lTT1N0cmluZygpIH0pKTsKK30KKworYXN5bmMgZnVuY3Rpb24gcHJlc2VydmVBZnRlcldvcmtlcih7IHdvcmtlckNsb3NlZCwgc2Vzc2lvblJvb3QsIGZpeHR1cmVEaXJlY3RvcnksIGV2aWRlbmNlRGlyZWN0b3J5LCB2YWxpZGF0ZVNuYXBzaG90LCBhY2tub3dsZWRnZUFydGlmYWN0IH0pIHsKKyAgaWYgKHR5cGVvZiB2YWxpZGF0ZVNuYXBzaG90ICE9PSAnZnVuY3Rpb24nIHx8IHR5cGVvZiBhY2tub3dsZWRnZUFydGlmYWN0ICE9PSAnZnVuY3Rpb24nKSB0aHJvdyBuZXcgRXJyb3IoJ1NuYXBzaG90IGFuZCByZW1vdGUgYXJ0aWZhY3QgdmFsaWRhdG9ycyBhcmUgcmVxdWlyZWQnKTsKKyAgY29uc3QgY2xvc2VkID0gYXdhaXQgd29ya2VyQ2xvc2VkOworICBpZiAoIWNsb3NlZCB8fCAhTnVtYmVyLmlzSW50ZWdlcihjbG9zZWQucGlkKSB8fCBjbG9zZWQuc2lnbmFsICE9PSBudWxsKSB0aHJvdyBuZXcgRXJyb3IoJ1dvcmtlciBkaWQgbm90IGV4aXQgbmF0dXJhbGx5Jyk7CisgIGNvbnN0IHJvb3QgPSBhd2FpdCBjaGVja2VkRGlyZWN0b3J5KHNlc3Npb25Sb290KTsKKyAgaWYgKCEvXmYzODctY2xlYW51cC1zb2x1dGlvbi1bQS1aYS16MC05Xy1dKyQvLnRlc3QocGF0aC5iYXNlbmFtZShyb290KSkpIHRocm93IG5ldyBFcnJvcignTm90IGEgZGVkaWNhdGVkIHN5bnRoZXRpYyBzZXNzaW9uJyk7CisgIGNvbnN0IGZpeHR1cmUgPSBhd2FpdCBjaGVja2VkRGlyZWN0b3J5KGZpeHR1cmVEaXJlY3RvcnkpOworICBpZiAocGF0aC5kaXJuYW1lKGZpeHR1cmUpICE9PSByb290IHx8ICEvXmRiLXYwOTAtbGlmdC1bQS1aYS16MC05XSskLy50ZXN0KHBhdGguYmFzZW5hbWUoZml4dHVyZSkpKSB0aHJvdyBuZXcgRXJyb3IoJ0ZpeHR1cmUgaXMgb3V0c2lkZSB0aGUgZGVkaWNhdGVkIHNlc3Npb24nKTsKKyAgY29uc3QgZXZpZGVuY2UgPSBwYXRoLnJlc29sdmUoZXZpZGVuY2VEaXJlY3RvcnkpOworICBpZiAocGF0aC5kaXJuYW1lKGV2aWRlbmNlKSAhPT0gcm9vdCB8fCBwYXRoLmJhc2VuYW1lKGV2aWRlbmNlKSAhPT0gJ3NlYWxlZCcpIHRocm93IG5ldyBFcnJvcignRXZpZGVuY2UgbXVzdCBiZSB0aGUgZGVkaWNhdGVkIHNlYWxlZCBzaWJsaW5nJyk7CisgIGF3YWl0IGZzLm1rZGlyKGV2aWRlbmNlKTsKKyAgYXdhaXQgY2hlY2tlZERpcmVjdG9yeShldmlkZW5jZSk7CisgIGNvbnN0IGludmVudG9yeSA9IGF3YWl0IGZpeHR1cmVJbnZlbnRvcnkoZml4dHVyZSk7CisgIGZvciAoY29uc3QgZmlsZSBvZiBpbnZlbnRvcnkpIHsKKyAgICBjb25zdCBieXRlcyA9IGF3YWl0IGZzLnJlYWRGaWxlKHBhdGguam9pbihmaXh0dXJlLCBmaWxlLm5hbWUpKTsKKyAgICBpZiAoZGlnZXN0KGJ5dGVzKSAhPT0gZmlsZS5zaGEyNTYpIHRocm93IG5ldyBFcnJvcignRml4dHVyZSBjaGFuZ2VkIGJlZm9yZSBzZWFsaW5nJyk7CisgICAgYXdhaXQgZnMud3JpdGVGaWxlKHBhdGguam9pbihldmlkZW5jZSwgZmlsZS5uYW1lKSwgYnl0ZXMsIHsgZmxhZzogJ3d4JyB9KTsKKyAgfQorICBjb25zdCBtYW5pZmVzdCA9IHsgZm9ybWF0OiAxLCBtb2RlOiAncG9zdC1uYXR1cmFsLWV4aXQnLCB3b3JrZXI6IGNsb3NlZCwgZmlsZXM6IGludmVudG9yeSB9OworICBjb25zdCBtYW5pZmVzdEJ5dGVzID0gQnVmZmVyLmZyb20oSlNPTi5zdHJpbmdpZnkobWFuaWZlc3QsIG51bGwsIDIpICsgJ1xuJyk7CisgIGNvbnN0IG1hbmlmZXN0U2hhMjU2ID0gZGlnZXN0KG1hbmlmZXN0Qnl0ZXMpOworICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKGV2aWRlbmNlLCAnbWFuaWZlc3QuanNvbicpLCBtYW5pZmVzdEJ5dGVzLCB7IGZsYWc6ICd3eCcgfSk7CisgIGNvbnN0IHNuYXBzaG90ID0gYXdhaXQgdmFsaWRhdGVTbmFwc2hvdCh7IGV2aWRlbmNlRGlyZWN0b3J5OiBldmlkZW5jZSwgbWFuaWZlc3QsIG1hbmlmZXN0U2hhMjU2IH0pOworICBpZiAoIXNuYXBzaG90IHx8IHNuYXBzaG90LmludGVncml0eSAhPT0gJ29rJyB8fCBzbmFwc2hvdC5zY2hlbWFBbmRSb3dzVmVyaWZpZWQgIT09IHRydWUpIHRocm93IG5ldyBFcnJvcignU25hcHNob3QgdmFsaWRhdGlvbiBmYWlsZWQ7IHByZXNlcnZlIGFsbCBmaWxlcycpOworICBjb25zdCBhY2sgPSBhd2FpdCBhY2tub3dsZWRnZUFydGlmYWN0KHsgZXZpZGVuY2VEaXJlY3Rvcnk6IGV2aWRlbmNlLCBtYW5pZmVzdCwgbWFuaWZlc3RTaGEyNTYsIHNuYXBzaG90IH0pOworICBpZiAoIWFjayB8fCBhY2subWFuaWZlc3RTaGEyNTYgIT09IG1hbmlmZXN0U2hhMjU2IHx8IGFjay5kb3dubG9hZEhhc2hlc1ZlcmlmaWVkICE9PSB0cnVlIHx8IGFjay5kb3dubG9hZFJlc3RvcmVWZXJpZmllZCAhPT0gdHJ1ZSB8fCAhL15cZCskLy50ZXN0KFN0cmluZyhhY2suYXJ0aWZhY3RJZCkpKSB0aHJvdyBuZXcgRXJyb3IoJ1JlbW90ZSBhcnRpZmFjdCBhY2tub3dsZWRnZW1lbnQgYWJzZW50OyBwcmVzZXJ2ZSBhbGwgZmlsZXMnKTsKKyAgY29uc3QgYWNrbm93bGVkZ2VtZW50ID0geyAuLi5hY2ssIHJlY2VpdmVkQXQ6IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKSB9OworICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKGV2aWRlbmNlLCAnYWNrbm93bGVkZ2VtZW50Lmpzb24nKSwgSlNPTi5zdHJpbmdpZnkoYWNrbm93bGVkZ2VtZW50LCBudWxsLCAyKSArICdcbicsIHsgZmxhZzogJ3d4JyB9KTsKKyAgbGV0IGNvbnN1bWVkID0gZmFsc2U7CisgIGNvbnN0IGNhbkNsZWFuID0gY2xvc2VkLmV4aXRDb2RlID09PSAwOworICByZXR1cm4geworICAgIHdvcmtlcjogY2xvc2VkLAorICAgIGV2aWRlbmNlRGlyZWN0b3J5OiBldmlkZW5jZSwKKyAgICBtYW5pZmVzdFNoYTI1NiwKKyAgICBjbGVhbnVwRWxpZ2libGU6IGNhbkNsZWFuLAorICAgIGFzeW5jIHJlbW92ZVN5bnRoZXRpY0ZpeHR1cmUoeyBhbGxvd1N5bnRoZXRpY0RlbGV0aW9uID0gZmFsc2UgfSA9IHt9KSB7CisgICAgICBpZiAoYWxsb3dTeW50aGV0aWNEZWxldGlvbiAhPT0gdHJ1ZSB8fCAhY2FuQ2xlYW4gfHwgY29uc3VtZWQpIHRocm93IG5ldyBFcnJvcignU3ludGhldGljIGNsZWFudXAgbm90IGV4cGxpY2l0bHkgZW5hYmxlZCBvciB3b3JrZXIgZmFpbGVkJyk7CisgICAgICBpZiAoYXdhaXQgY2hlY2tlZERpcmVjdG9yeShyb290KSAhPT0gcm9vdCB8fCBhd2FpdCBjaGVja2VkRGlyZWN0b3J5KGZpeHR1cmUpICE9PSBmaXh0dXJlIHx8IGF3YWl0IGNoZWNrZWREaXJlY3RvcnkoZXZpZGVuY2UpICE9PSBldmlkZW5jZSkgdGhyb3cgbmV3IEVycm9yKCdQYXRocyBjaGFuZ2VkJyk7CisgICAgICBpZiAoZGlnZXN0KGF3YWl0IGZzLnJlYWRGaWxlKHBhdGguam9pbihldmlkZW5jZSwgJ21hbmlmZXN0Lmpzb24nKSkpICE9PSBtYW5pZmVzdFNoYTI1NikgdGhyb3cgbmV3IEVycm9yKCdTZWFsZWQgbWFuaWZlc3QgY2hhbmdlZCcpOworICAgICAgZm9yIChjb25zdCBmaWxlIG9mIGludmVudG9yeSkgeworICAgICAgICBjb25zdCBzZWFsZWRGaWxlID0gcGF0aC5qb2luKGV2aWRlbmNlLCBmaWxlLm5hbWUpOworICAgICAgICBjb25zdCBzdGF0ID0gYXdhaXQgZnMubHN0YXQoc2VhbGVkRmlsZSk7CisgICAgICAgIGlmICghc3RhdC5pc0ZpbGUoKSB8fCBzdGF0LmlzU3ltYm9saWNMaW5rKCkgfHwgZGlnZXN0KGF3YWl0IGZzLnJlYWRGaWxlKHNlYWxlZEZpbGUpKSAhPT0gZmlsZS5zaGEyNTYpIHRocm93IG5ldyBFcnJvcignU2VhbGVkIGV2aWRlbmNlIGNoYW5nZWQnKTsKKyAgICAgIH0KKyAgICAgIGlmIChKU09OLnN0cmluZ2lmeShhd2FpdCBmaXh0dXJlSW52ZW50b3J5KGZpeHR1cmUpKSAhPT0gSlNPTi5zdHJpbmdpZnkoaW52ZW50b3J5KSkgdGhyb3cgbmV3IEVycm9yKCdGaXh0dXJlIGNoYW5nZWQgYWZ0ZXIgc2VhbGluZycpOworICAgICAgY29uc3VtZWQgPSB0cnVlOworICAgICAgZm9yIChjb25zdCBmaWxlIG9mIGludmVudG9yeSkgYXdhaXQgZnMudW5saW5rKHBhdGguam9pbihmaXh0dXJlLCBmaWxlLm5hbWUpKTsKKyAgICAgIGF3YWl0IGZzLnJtZGlyKGZpeHR1cmUpOworICAgICAgcmV0dXJuIHsgcmVtb3ZlZDogZml4dHVyZSwgZXZpZGVuY2VQcmVzZXJ2ZWQ6IGV2aWRlbmNlIH07CisgICAgfSwKKyAgfTsKK30KKworbW9kdWxlLmV4cG9ydHMgPSB7IG9ic2VydmVXb3JrZXIsIHByZXNlcnZlQWZ0ZXJXb3JrZXIgfTsKZGlmZiAtLWdpdCBhL3Rlc3RzL2RhdGFiYXNlLW1pZ3JhdGlvbi50ZXN0LnRzIGIvdGVzdHMvZGF0YWJhc2UtbWlncmF0aW9uLnRlc3QudHMKaW5kZXggYjZhMDRiYy4uNTQ3MWQ4ZiAxMDA2NDQKLS0tIGEvdGVzdHMvZGF0YWJhc2UtbWlncmF0aW9uLnRlc3QudHMKKysrIGIvdGVzdHMvZGF0YWJhc2UtbWlncmF0aW9uLnRlc3QudHMKQEAgLTEsMyArMSw0IEBACitpbXBvcnQgeyByZWdpc3Rlcklzb2xhdGVkRml4dHVyZSwgcmV0YWluSXNvbGF0ZWRGaXh0dXJlIH0gZnJvbSAnLi9oZWxwZXJzL2lzb2xhdGVkLWZpeHR1cmUubWpzJzsKIGltcG9ydCB7IGRlc2NyaWJlLCBpdCwgZXhwZWN0LCBhZnRlckVhY2gsIHZpIH0gZnJvbSAndml0ZXN0JzsKIGltcG9ydCB7IG1rZHRlbXAsIHJlYWRGaWxlLCBybSB9IGZyb20gJ25vZGU6ZnMvcHJvbWlzZXMnOwogaW1wb3J0IHsgZXhpc3RzU3luYyB9IGZyb20gJ25vZGU6ZnMnOwpAQCAtMTI5LDcgKzEzMCw5IEBAIGRlc2NyaWJlKCdzY2hlbWEgYm9vdCBhZnRlciB0aGUgcGxhbi0zNiBmbGF0dGVuJywgKCkgPT4gewogCiAgIGl0KCdsaWZ0cyBhIHYwLjkuMCBwcm9maWxlIChubyBoZWFkKSB0byB0aGUgc2NoZW1hIGhlYWQgYW5kIGtlZXBzIGl0cyBkYXRhJywgYXN5bmMgKCkgPT4gewogICAgIGNvbnN0IGxlZ2FjeURpciA9IGF3YWl0IG1rZHRlbXAocGF0aC5qb2luKHRtcGRpcigpLCAnZGItdjA5MC1saWZ0LScpKTsKLSAgICBkaXIgPSBsZWdhY3lEaXI7CisgICAgY29uc3QgaXNvbGF0ZWRGaXh0dXJlID0gQm9vbGVhbihwcm9jZXNzLmVudi5GMzg3X0lTT0xBVEVEX1JPT1QpOworICAgIGlmIChpc29sYXRlZEZpeHR1cmUpIHJlZ2lzdGVySXNvbGF0ZWRGaXh0dXJlKGxlZ2FjeURpcik7CisgICAgZWxzZSBkaXIgPSBsZWdhY3lEaXI7CiAgICAgdHJ5IHsKICAgICAgIGNvbnN0IGxlZ2FjeSA9IGF3YWl0IG9wZW5EYXRhYmFzZShwYXRoLmpvaW4obGVnYWN5RGlyLCAnY29udmVyc2F0aW9ucy5kYicpKTsKICAgICAgIGF3YWl0IGV4ZWN1dGVTY3JpcHQobGVnYWN5LCBWMDkwX1NRTCk7CkBAIC0xODUsNyArMTg4LDggQEAgZGVzY3JpYmUoJ3NjaGVtYSBib290IGFmdGVyIHRoZSBwbGFuLTM2IGZsYXR0ZW4nLCAoKSA9PiB7CiAgICAgICApOwogICAgICAgYXdhaXQgcmVvcGVuZWQuJGRpc2Nvbm5lY3QoKTsKICAgICB9IGZpbmFsbHkgewotICAgICAgYXdhaXQgcm0obGVnYWN5RGlyLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7CisgICAgICBpZiAoaXNvbGF0ZWRGaXh0dXJlKSByZXRhaW5Jc29sYXRlZEZpeHR1cmUobGVnYWN5RGlyKTsKKyAgICAgIGVsc2UgYXdhaXQgcm0obGVnYWN5RGlyLCB7IHJlY3Vyc2l2ZTogdHJ1ZSwgZm9yY2U6IHRydWUgfSk7CiAgICAgfQogICB9KTsKIApkaWZmIC0tZ2l0IGEvdGVzdHMvaGVscGVycy9pc29sYXRlZC1maXh0dXJlLmQubXRzIGIvdGVzdHMvaGVscGVycy9pc29sYXRlZC1maXh0dXJlLmQubXRzCm5ldyBmaWxlIG1vZGUgMTAwNjQ0CmluZGV4IDAwMDAwMDAuLmY2YzQ2OGYKLS0tIC9kZXYvbnVsbAorKysgYi90ZXN0cy9oZWxwZXJzL2lzb2xhdGVkLWZpeHR1cmUuZC5tdHMKQEAgLTAsMCArMSwyIEBACitleHBvcnQgZnVuY3Rpb24gcmVnaXN0ZXJJc29sYXRlZEZpeHR1cmUoZGlyZWN0b3J5OiBzdHJpbmcpOiB2b2lkOworZXhwb3J0IGZ1bmN0aW9uIHJldGFpbklzb2xhdGVkRml4dHVyZShkaXJlY3Rvcnk6IHN0cmluZyk6IHZvaWQ7CmRpZmYgLS1naXQgYS90ZXN0cy9oZWxwZXJzL2lzb2xhdGVkLWZpeHR1cmUubWpzIGIvdGVzdHMvaGVscGVycy9pc29sYXRlZC1maXh0dXJlLm1qcwpuZXcgZmlsZSBtb2RlIDEwMDY0NAppbmRleCAwMDAwMDAwLi43MWNkNDZkCi0tLSAvZGV2L251bGwKKysrIGIvdGVzdHMvaGVscGVycy9pc29sYXRlZC1maXh0dXJlLm1qcwpAQCAtMCwwICsxLDI3IEBACitpbXBvcnQgYXNzZXJ0IGZyb20gJ25vZGU6YXNzZXJ0L3N0cmljdCc7CitpbXBvcnQgZnMgZnJvbSAnbm9kZTpmcyc7CitpbXBvcnQgcGF0aCBmcm9tICdub2RlOnBhdGgnOworaW1wb3J0IHsgdG1wZGlyIH0gZnJvbSAnbm9kZTpvcyc7CisKK2Z1bmN0aW9uIGNoZWNrZWRGaXh0dXJlKGRpcmVjdG9yeSkgeworICBjb25zdCByb290ID0gcHJvY2Vzcy5lbnYuRjM4N19JU09MQVRFRF9ST09UOworICBhc3NlcnQocm9vdCwgJ1J1biB0aGlzIGNhc2Ugd2l0aCB0aGUgaXNvbGF0ZWQgc3VwZXJ2aXNvcicpOworICBhc3NlcnQuZXF1YWwoZnMucmVhbHBhdGhTeW5jKHRtcGRpcigpKSwgZnMucmVhbHBhdGhTeW5jKHJvb3QpKTsKKyAgYXNzZXJ0Lm1hdGNoKHBhdGguYmFzZW5hbWUocm9vdCksIC9eZjM4Ny1jbGVhbnVwLXNvbHV0aW9uLVtBLVphLXowLTlfLV0rJC8pOworICBhc3NlcnQuZXF1YWwocGF0aC5kaXJuYW1lKGZzLnJlYWxwYXRoU3luYyhkaXJlY3RvcnkpKSwgZnMucmVhbHBhdGhTeW5jKHJvb3QpKTsKKyAgYXNzZXJ0Lm1hdGNoKHBhdGguYmFzZW5hbWUoZGlyZWN0b3J5KSwgL15kYi12MDkwLWxpZnQtW0EtWmEtejAtOV0rJC8pOworICBhc3NlcnQoIWZzLmxzdGF0U3luYyhkaXJlY3RvcnkpLmlzU3ltYm9saWNMaW5rKCkpOworICByZXR1cm4gcm9vdDsKK30KKworZXhwb3J0IGZ1bmN0aW9uIHJlZ2lzdGVySXNvbGF0ZWRGaXh0dXJlKGRpcmVjdG9yeSkgeworICBjb25zdCByb290ID0gY2hlY2tlZEZpeHR1cmUoZGlyZWN0b3J5KTsKKyAgZnMud3JpdGVGaWxlU3luYyhwYXRoLmpvaW4ocm9vdCwgJ2ZpeHR1cmUtaGFuZG9mZi5qc29uJyksIEpTT04uc3RyaW5naWZ5KHsgcGlkOiBwcm9jZXNzLnBpZCwgZGlyZWN0b3J5OiBwYXRoLmJhc2VuYW1lKGRpcmVjdG9yeSkgfSksIHsgZmxhZzogJ3d4JyB9KTsKK30KKworZXhwb3J0IGZ1bmN0aW9uIHJldGFpbklzb2xhdGVkRml4dHVyZShkaXJlY3RvcnkpIHsKKyAgY29uc3Qgcm9vdCA9IGNoZWNrZWRGaXh0dXJlKGRpcmVjdG9yeSk7CisgIGNvbnN0IGhhbmRvZmYgPSBKU09OLnBhcnNlKGZzLnJlYWRGaWxlU3luYyhwYXRoLmpvaW4ocm9vdCwgJ2ZpeHR1cmUtaGFuZG9mZi5qc29uJyksICd1dGY4JykpOworICBhc3NlcnQuZXF1YWwoaGFuZG9mZi5waWQsIHByb2Nlc3MucGlkKTsKKyAgYXNzZXJ0LmVxdWFsKGhhbmRvZmYuZGlyZWN0b3J5LCBwYXRoLmJhc2VuYW1lKGRpcmVjdG9yeSkpOworfQo='))
+          git -C $repo apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate patch check failed' }
+          git -C $repo apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate patch application failed' }
+          Write-Output 'Applied reviewed candidate patch to fixed disposable checkout only'
           @'
           param([string]$Directory)
           $ErrorActionPreference = 'Stop'
@@ -892,7 +170,7 @@ jobs:
           const aliased = {'@main':'src/main','@renderer':'src/renderer','@shared':'src/shared','@preload':'src/preload','@packs':'src/packs','generated/prisma/client':'src/generated/prisma/client.ts'};
           const alias = Object.fromEntries(Object.entries(aliased).map(([k,v])=>[k,path.join(root,v)]));
           export default {root,cacheDir:path.join(run,'vite-cache'),envDir:false,resolve:{alias},optimizeDeps:{exclude:['@neuronection/assistant-ui']},test:{
-            include:['tests/database-migration.test.ts'],setupFiles:['tests/setup/canvas.ts','tests/setup/react-env.ts'],environment:'node',allowOnly:true,testTimeout:30000,hookTimeout:20000,maxWorkers:1,watch:false,fileParallelism:false,cache:false,fsModuleCache:false,coverage:{enabled:false},retry:0,api:false,ui:false,open:false,pool:'forks',execArgv:['--expose-gc'],attachmentsDir:path.join(run,'attachments')
+            include:['tests/database-migration.test.ts'],setupFiles:['tests/setup/canvas.ts','tests/setup/react-env.ts'],environment:'node',allowOnly:true,testTimeout:30000,hookTimeout:20000,maxWorkers:1,watch:false,fileParallelism:false,cache:false,fsModuleCache:false,coverage:{enabled:false},retry:0,api:false,ui:false,open:false,pool:'forks',attachmentsDir:path.join(run,'attachments')
           }};
           '@ | Set-Content -LiteralPath $config -Encoding utf8
           @'
@@ -901,7 +179,7 @@ jobs:
           const fs = require('node:fs');
           const { execFileSync, spawnSync } = require('node:child_process');
           const [repo,temp,runId,sid,mode] = process.argv.slice(2);
-          assert(['wait','gc'].includes(mode));
+          assert.equal(mode,'candidate');
           assert.match(runId,/^[0-9]+-1-id88$/);
           assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
           const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
@@ -909,7 +187,7 @@ jobs:
           assert(!execFileSync(whoami,['/groups'],{encoding:'utf8'}).includes('S-1-5-32-544'));
           assert.throws(()=>{const fd=fs.openSync(path.join(repo,'package-lock.json'),'r+');fs.closeSync(fd);},{code:/^(EACCES|EPERM)$/});
           const casePattern = '^schema boot after the plan-36 flatten > lifts a v0\\.9\\.0 profile \\(no head\\) to the schema head and keeps its data$';
-          const env = {...process.env,TEMP:temp,TMP:temp,TMPDIR:temp,F387_DIAGNOSTIC_ROOT:temp,F387_RUN_ID:runId,F387_GC_MODE:mode};
+          const env = {...process.env,TEMP:temp,TMP:temp,TMPDIR:temp,F387_DIAGNOSTIC_ROOT:temp,F387_RUN_ID:runId,F387_GC_MODE:mode,F387_ISOLATED_ROOT:temp};
           const lock = JSON.parse(fs.readFileSync(path.join(repo,'node_modules/@prisma/adapter-libsql/node_modules/@libsql/client/package.json'),'utf8'));
           assert.equal(process.version,'v24.22.3'); assert.equal(lock.version,'0.17.4');
           const proc = spawnSync(process.execPath,[path.join(repo,'node_modules/vitest/vitest.mjs'),'run','tests/database-migration.test.ts','--config',path.join(repo,'f387-id88.config.mjs'),'--configLoader','runner','--testNamePattern',casePattern,'--maxWorkers','1','--no-file-parallelism','--no-cache','--reporter','verbose','--reporter','json','--outputFile.json',path.join(temp,'result.json')],{cwd:repo,env,stdio:'inherit',windowsHide:true});
@@ -925,16 +203,16 @@ jobs:
           $proc = Start-Process -FilePath $node -ArgumentList $argsForWorker -Credential $cred -UseNewEnvironment -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
           Get-Content -LiteralPath $stdout
           Get-Content -LiteralPath $stderr
-          $handoff = Join-Path $temp.FullName 'worker-handoff.json'
+          $handoff = Join-Path $temp.FullName 'fixture-handoff.json'
           $sources = @{}
-          foreach ($name in 'worker-handoff.json','pre-cleanup.json','result.json','lifecycle.jsonl') {
+          foreach ($name in 'fixture-handoff.json','result.json') {
             $candidate = Join-Path $temp.FullName $name
             if (Test-Path -LiteralPath $candidate) { $sources[$name] = $candidate }
           }
           if (Test-Path -LiteralPath $handoff -PathType Leaf) {
             $h = Get-Content -LiteralPath $handoff -Raw | ConvertFrom-Json
-            if ($h.runId -cne $runId -or $h.dir -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$') { throw 'Invalid handoff' }
-            $directory = Get-Item -LiteralPath (Join-Path $temp.FullName $h.dir) -Force
+            if ($h.directory -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$' -or $h.pid -le 0) { throw 'Invalid candidate handoff' }
+            $directory = Get-Item -LiteralPath (Join-Path $temp.FullName $h.directory) -Force
             if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid source directory' }
             $after = & (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -File $probe $directory.FullName
             if ($LASTEXITCODE -ne 0) { throw 'Post-exit probe failed' }
@@ -957,27 +235,32 @@ jobs:
               try { $held[$name].CopyTo($out) } finally { $out.Dispose() }
             }
           } finally { foreach ($stream in $held.Values) { $stream.Dispose() } }
+          $candidateModule = Join-Path $root 'candidate-boundary.cjs'
+          [IO.File]::WriteAllBytes($candidateModule,[Convert]::FromBase64String('Y29uc3QgZnMgPSByZXF1aXJlKCdub2RlOmZzL3Byb21pc2VzJyk7CmNvbnN0IHBhdGggPSByZXF1aXJlKCdub2RlOnBhdGgnKTsKY29uc3QgY3J5cHRvID0gcmVxdWlyZSgnbm9kZTpjcnlwdG8nKTsKY29uc3QgeyBvbmNlIH0gPSByZXF1aXJlKCdub2RlOmV2ZW50cycpOwoKY29uc3QgZGlnZXN0ID0gYnl0ZXMgPT4gY3J5cHRvLmNyZWF0ZUhhc2goJ3NoYTI1NicpLnVwZGF0ZShieXRlcykuZGlnZXN0KCdoZXgnKTsKY29uc3QgYWxsb3dlZE5hbWVzID0gbmV3IFNldChbJ2NvbnZlcnNhdGlvbnMuZGInLCAnY29udmVyc2F0aW9ucy5kYi13YWwnLCAnY29udmVyc2F0aW9ucy5kYi1zaG0nXSk7Cgphc3luYyBmdW5jdGlvbiBjaGVja2VkRGlyZWN0b3J5KGRpcmVjdG9yeSkgewogIGNvbnN0IGFic29sdXRlID0gcGF0aC5yZXNvbHZlKGRpcmVjdG9yeSk7CiAgY29uc3Qgcm9vdCA9IHBhdGgucGFyc2UoYWJzb2x1dGUpLnJvb3Q7CiAgbGV0IGN1cnJlbnQgPSByb290OwogIGZvciAoY29uc3QgcGFydCBvZiBhYnNvbHV0ZS5zbGljZShyb290Lmxlbmd0aCkuc3BsaXQocGF0aC5zZXApLmZpbHRlcihCb29sZWFuKSkgewogICAgY3VycmVudCA9IHBhdGguam9pbihjdXJyZW50LCBwYXJ0KTsKICAgIGNvbnN0IHN0YXQgPSBhd2FpdCBmcy5sc3RhdChjdXJyZW50KTsKICAgIGlmIChzdGF0LmlzU3ltYm9saWNMaW5rKCkgfHwgIXN0YXQuaXNEaXJlY3RvcnkoKSkgdGhyb3cgbmV3IEVycm9yKCdEaXJlY3Rvcnkgb3IgYW5jZXN0b3IgaXMgYSBsaW5rIG9yIG5vdCBhIGRpcmVjdG9yeScpOwogIH0KICBpZiAoKGF3YWl0IGZzLnJlYWxwYXRoKGFic29sdXRlKSkudG9Mb3dlckNhc2UoKSAhPT0gYWJzb2x1dGUudG9Mb3dlckNhc2UoKSkgdGhyb3cgbmV3IEVycm9yKCdVbmV4cGVjdGVkIGRpcmVjdG9yeSByZXNvbHV0aW9uJyk7CiAgcmV0dXJuIGFic29sdXRlOwp9Cgphc3luYyBmdW5jdGlvbiBmaXh0dXJlSW52ZW50b3J5KGRpcmVjdG9yeSkgewogIGNvbnN0IGVudHJpZXMgPSBhd2FpdCBmcy5yZWFkZGlyKGRpcmVjdG9yeSwgeyB3aXRoRmlsZVR5cGVzOiB0cnVlIH0pOwogIGlmICghZW50cmllcy5zb21lKGVudHJ5ID0+IGVudHJ5Lm5hbWUgPT09ICdjb252ZXJzYXRpb25zLmRiJykpIHRocm93IG5ldyBFcnJvcignUHJpbWFyeSBkYXRhYmFzZSBtaXNzaW5nJyk7CiAgY29uc3QgZmlsZXMgPSBbXTsKICBmb3IgKGNvbnN0IGVudHJ5IG9mIGVudHJpZXMuc29ydCgoYSwgYikgPT4gYS5uYW1lLmxvY2FsZUNvbXBhcmUoYi5uYW1lKSkpIHsKICAgIGlmICghYWxsb3dlZE5hbWVzLmhhcyhlbnRyeS5uYW1lKSB8fCAhZW50cnkuaXNGaWxlKCkgfHwgZW50cnkuaXNTeW1ib2xpY0xpbmsoKSkgdGhyb3cgbmV3IEVycm9yKCdVbmV4cGVjdGVkIGZpeHR1cmUgZW50cnknKTsKICAgIGNvbnN0IGZpbGUgPSBwYXRoLmpvaW4oZGlyZWN0b3J5LCBlbnRyeS5uYW1lKTsKICAgIGNvbnN0IGJlZm9yZSA9IGF3YWl0IGZzLmxzdGF0KGZpbGUpOwogICAgaWYgKCFiZWZvcmUuaXNGaWxlKCkgfHwgYmVmb3JlLmlzU3ltYm9saWNMaW5rKCkpIHRocm93IG5ldyBFcnJvcignVW5zYWZlIGZpeHR1cmUgZW50cnknKTsKICAgIGNvbnN0IGJ5dGVzID0gYXdhaXQgZnMucmVhZEZpbGUoZmlsZSk7CiAgICBjb25zdCBhZnRlciA9IGF3YWl0IGZzLmxzdGF0KGZpbGUpOwogICAgaWYgKGJlZm9yZS5zaXplICE9PSBhZnRlci5zaXplIHx8IGJlZm9yZS5tdGltZU1zICE9PSBhZnRlci5tdGltZU1zIHx8IGJlZm9yZS5pbm8gIT09IGFmdGVyLmlubykgdGhyb3cgbmV3IEVycm9yKCdGaXh0dXJlIGNoYW5nZWQgZHVyaW5nIGludmVudG9yeScpOwogICAgZmlsZXMucHVzaCh7IG5hbWU6IGVudHJ5Lm5hbWUsIGJ5dGVzOiBieXRlcy5sZW5ndGgsIHNoYTI1NjogZGlnZXN0KGJ5dGVzKSB9KTsKICB9CiAgcmV0dXJuIGZpbGVzOwp9CgpmdW5jdGlvbiBvYnNlcnZlV29ya2VyKGNoaWxkKSB7CiAgaWYgKCFjaGlsZCB8fCAhTnVtYmVyLmlzSW50ZWdlcihjaGlsZC5waWQpIHx8IGNoaWxkLmV4aXRDb2RlICE9PSBudWxsIHx8IGNoaWxkLnNpZ25hbENvZGUgIT09IG51bGwpIHRocm93IG5ldyBFcnJvcignQXR0YWNoIG9ic2VydmVyIGltbWVkaWF0ZWx5IGFmdGVyIHNwYXduaW5nIGEgbGl2ZSB3b3JrZXInKTsKICByZXR1cm4gb25jZShjaGlsZCwgJ2Nsb3NlJykudGhlbigoW2V4aXRDb2RlLCBzaWduYWxdKSA9PiAoeyBwaWQ6IGNoaWxkLnBpZCwgZXhpdENvZGUsIHNpZ25hbCwgb2JzZXJ2ZWRBdDogbmV3IERhdGUoKS50b0lTT1N0cmluZygpIH0pKTsKfQoKYXN5bmMgZnVuY3Rpb24gcHJlc2VydmVBZnRlcldvcmtlcih7IHdvcmtlckNsb3NlZCwgc2Vzc2lvblJvb3QsIGZpeHR1cmVEaXJlY3RvcnksIGV2aWRlbmNlRGlyZWN0b3J5LCB2YWxpZGF0ZVNuYXBzaG90LCBhY2tub3dsZWRnZUFydGlmYWN0IH0pIHsKICBpZiAodHlwZW9mIHZhbGlkYXRlU25hcHNob3QgIT09ICdmdW5jdGlvbicgfHwgdHlwZW9mIGFja25vd2xlZGdlQXJ0aWZhY3QgIT09ICdmdW5jdGlvbicpIHRocm93IG5ldyBFcnJvcignU25hcHNob3QgYW5kIHJlbW90ZSBhcnRpZmFjdCB2YWxpZGF0b3JzIGFyZSByZXF1aXJlZCcpOwogIGNvbnN0IGNsb3NlZCA9IGF3YWl0IHdvcmtlckNsb3NlZDsKICBpZiAoIWNsb3NlZCB8fCAhTnVtYmVyLmlzSW50ZWdlcihjbG9zZWQucGlkKSB8fCBjbG9zZWQuc2lnbmFsICE9PSBudWxsKSB0aHJvdyBuZXcgRXJyb3IoJ1dvcmtlciBkaWQgbm90IGV4aXQgbmF0dXJhbGx5Jyk7CiAgY29uc3Qgcm9vdCA9IGF3YWl0IGNoZWNrZWREaXJlY3Rvcnkoc2Vzc2lvblJvb3QpOwogIGlmICghL15mMzg3LWNsZWFudXAtc29sdXRpb24tW0EtWmEtejAtOV8tXSskLy50ZXN0KHBhdGguYmFzZW5hbWUocm9vdCkpKSB0aHJvdyBuZXcgRXJyb3IoJ05vdCBhIGRlZGljYXRlZCBzeW50aGV0aWMgc2Vzc2lvbicpOwogIGNvbnN0IGZpeHR1cmUgPSBhd2FpdCBjaGVja2VkRGlyZWN0b3J5KGZpeHR1cmVEaXJlY3RvcnkpOwogIGlmIChwYXRoLmRpcm5hbWUoZml4dHVyZSkgIT09IHJvb3QgfHwgIS9eZGItdjA5MC1saWZ0LVtBLVphLXowLTldKyQvLnRlc3QocGF0aC5iYXNlbmFtZShmaXh0dXJlKSkpIHRocm93IG5ldyBFcnJvcignRml4dHVyZSBpcyBvdXRzaWRlIHRoZSBkZWRpY2F0ZWQgc2Vzc2lvbicpOwogIGNvbnN0IGV2aWRlbmNlID0gcGF0aC5yZXNvbHZlKGV2aWRlbmNlRGlyZWN0b3J5KTsKICBpZiAocGF0aC5kaXJuYW1lKGV2aWRlbmNlKSAhPT0gcm9vdCB8fCBwYXRoLmJhc2VuYW1lKGV2aWRlbmNlKSAhPT0gJ3NlYWxlZCcpIHRocm93IG5ldyBFcnJvcignRXZpZGVuY2UgbXVzdCBiZSB0aGUgZGVkaWNhdGVkIHNlYWxlZCBzaWJsaW5nJyk7CiAgYXdhaXQgZnMubWtkaXIoZXZpZGVuY2UpOwogIGF3YWl0IGNoZWNrZWREaXJlY3RvcnkoZXZpZGVuY2UpOwogIGNvbnN0IGludmVudG9yeSA9IGF3YWl0IGZpeHR1cmVJbnZlbnRvcnkoZml4dHVyZSk7CiAgZm9yIChjb25zdCBmaWxlIG9mIGludmVudG9yeSkgewogICAgY29uc3QgYnl0ZXMgPSBhd2FpdCBmcy5yZWFkRmlsZShwYXRoLmpvaW4oZml4dHVyZSwgZmlsZS5uYW1lKSk7CiAgICBpZiAoZGlnZXN0KGJ5dGVzKSAhPT0gZmlsZS5zaGEyNTYpIHRocm93IG5ldyBFcnJvcignRml4dHVyZSBjaGFuZ2VkIGJlZm9yZSBzZWFsaW5nJyk7CiAgICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKGV2aWRlbmNlLCBmaWxlLm5hbWUpLCBieXRlcywgeyBmbGFnOiAnd3gnIH0pOwogIH0KICBjb25zdCBtYW5pZmVzdCA9IHsgZm9ybWF0OiAxLCBtb2RlOiAncG9zdC1uYXR1cmFsLWV4aXQnLCB3b3JrZXI6IGNsb3NlZCwgZmlsZXM6IGludmVudG9yeSB9OwogIGNvbnN0IG1hbmlmZXN0Qnl0ZXMgPSBCdWZmZXIuZnJvbShKU09OLnN0cmluZ2lmeShtYW5pZmVzdCwgbnVsbCwgMikgKyAnXG4nKTsKICBjb25zdCBtYW5pZmVzdFNoYTI1NiA9IGRpZ2VzdChtYW5pZmVzdEJ5dGVzKTsKICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKGV2aWRlbmNlLCAnbWFuaWZlc3QuanNvbicpLCBtYW5pZmVzdEJ5dGVzLCB7IGZsYWc6ICd3eCcgfSk7CiAgY29uc3Qgc25hcHNob3QgPSBhd2FpdCB2YWxpZGF0ZVNuYXBzaG90KHsgZXZpZGVuY2VEaXJlY3Rvcnk6IGV2aWRlbmNlLCBtYW5pZmVzdCwgbWFuaWZlc3RTaGEyNTYgfSk7CiAgaWYgKCFzbmFwc2hvdCB8fCBzbmFwc2hvdC5pbnRlZ3JpdHkgIT09ICdvaycgfHwgc25hcHNob3Quc2NoZW1hQW5kUm93c1ZlcmlmaWVkICE9PSB0cnVlKSB0aHJvdyBuZXcgRXJyb3IoJ1NuYXBzaG90IHZhbGlkYXRpb24gZmFpbGVkOyBwcmVzZXJ2ZSBhbGwgZmlsZXMnKTsKICBjb25zdCBhY2sgPSBhd2FpdCBhY2tub3dsZWRnZUFydGlmYWN0KHsgZXZpZGVuY2VEaXJlY3Rvcnk6IGV2aWRlbmNlLCBtYW5pZmVzdCwgbWFuaWZlc3RTaGEyNTYsIHNuYXBzaG90IH0pOwogIGlmICghYWNrIHx8IGFjay5tYW5pZmVzdFNoYTI1NiAhPT0gbWFuaWZlc3RTaGEyNTYgfHwgYWNrLmRvd25sb2FkSGFzaGVzVmVyaWZpZWQgIT09IHRydWUgfHwgYWNrLmRvd25sb2FkUmVzdG9yZVZlcmlmaWVkICE9PSB0cnVlIHx8ICEvXlxkKyQvLnRlc3QoU3RyaW5nKGFjay5hcnRpZmFjdElkKSkpIHRocm93IG5ldyBFcnJvcignUmVtb3RlIGFydGlmYWN0IGFja25vd2xlZGdlbWVudCBhYnNlbnQ7IHByZXNlcnZlIGFsbCBmaWxlcycpOwogIGNvbnN0IGFja25vd2xlZGdlbWVudCA9IHsgLi4uYWNrLCByZWNlaXZlZEF0OiBuZXcgRGF0ZSgpLnRvSVNPU3RyaW5nKCkgfTsKICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKGV2aWRlbmNlLCAnYWNrbm93bGVkZ2VtZW50Lmpzb24nKSwgSlNPTi5zdHJpbmdpZnkoYWNrbm93bGVkZ2VtZW50LCBudWxsLCAyKSArICdcbicsIHsgZmxhZzogJ3d4JyB9KTsKICBsZXQgY29uc3VtZWQgPSBmYWxzZTsKICBjb25zdCBjYW5DbGVhbiA9IGNsb3NlZC5leGl0Q29kZSA9PT0gMDsKICByZXR1cm4gewogICAgd29ya2VyOiBjbG9zZWQsCiAgICBldmlkZW5jZURpcmVjdG9yeTogZXZpZGVuY2UsCiAgICBtYW5pZmVzdFNoYTI1NiwKICAgIGNsZWFudXBFbGlnaWJsZTogY2FuQ2xlYW4sCiAgICBhc3luYyByZW1vdmVTeW50aGV0aWNGaXh0dXJlKHsgYWxsb3dTeW50aGV0aWNEZWxldGlvbiA9IGZhbHNlIH0gPSB7fSkgewogICAgICBpZiAoYWxsb3dTeW50aGV0aWNEZWxldGlvbiAhPT0gdHJ1ZSB8fCAhY2FuQ2xlYW4gfHwgY29uc3VtZWQpIHRocm93IG5ldyBFcnJvcignU3ludGhldGljIGNsZWFudXAgbm90IGV4cGxpY2l0bHkgZW5hYmxlZCBvciB3b3JrZXIgZmFpbGVkJyk7CiAgICAgIGlmIChhd2FpdCBjaGVja2VkRGlyZWN0b3J5KHJvb3QpICE9PSByb290IHx8IGF3YWl0IGNoZWNrZWREaXJlY3RvcnkoZml4dHVyZSkgIT09IGZpeHR1cmUgfHwgYXdhaXQgY2hlY2tlZERpcmVjdG9yeShldmlkZW5jZSkgIT09IGV2aWRlbmNlKSB0aHJvdyBuZXcgRXJyb3IoJ1BhdGhzIGNoYW5nZWQnKTsKICAgICAgaWYgKGRpZ2VzdChhd2FpdCBmcy5yZWFkRmlsZShwYXRoLmpvaW4oZXZpZGVuY2UsICdtYW5pZmVzdC5qc29uJykpKSAhPT0gbWFuaWZlc3RTaGEyNTYpIHRocm93IG5ldyBFcnJvcignU2VhbGVkIG1hbmlmZXN0IGNoYW5nZWQnKTsKICAgICAgZm9yIChjb25zdCBmaWxlIG9mIGludmVudG9yeSkgewogICAgICAgIGNvbnN0IHNlYWxlZEZpbGUgPSBwYXRoLmpvaW4oZXZpZGVuY2UsIGZpbGUubmFtZSk7CiAgICAgICAgY29uc3Qgc3RhdCA9IGF3YWl0IGZzLmxzdGF0KHNlYWxlZEZpbGUpOwogICAgICAgIGlmICghc3RhdC5pc0ZpbGUoKSB8fCBzdGF0LmlzU3ltYm9saWNMaW5rKCkgfHwgZGlnZXN0KGF3YWl0IGZzLnJlYWRGaWxlKHNlYWxlZEZpbGUpKSAhPT0gZmlsZS5zaGEyNTYpIHRocm93IG5ldyBFcnJvcignU2VhbGVkIGV2aWRlbmNlIGNoYW5nZWQnKTsKICAgICAgfQogICAgICBpZiAoSlNPTi5zdHJpbmdpZnkoYXdhaXQgZml4dHVyZUludmVudG9yeShmaXh0dXJlKSkgIT09IEpTT04uc3RyaW5naWZ5KGludmVudG9yeSkpIHRocm93IG5ldyBFcnJvcignRml4dHVyZSBjaGFuZ2VkIGFmdGVyIHNlYWxpbmcnKTsKICAgICAgY29uc3VtZWQgPSB0cnVlOwogICAgICBmb3IgKGNvbnN0IGZpbGUgb2YgaW52ZW50b3J5KSBhd2FpdCBmcy51bmxpbmsocGF0aC5qb2luKGZpeHR1cmUsIGZpbGUubmFtZSkpOwogICAgICBhd2FpdCBmcy5ybWRpcihmaXh0dXJlKTsKICAgICAgcmV0dXJuIHsgcmVtb3ZlZDogZml4dHVyZSwgZXZpZGVuY2VQcmVzZXJ2ZWQ6IGV2aWRlbmNlIH07CiAgICB9LAogIH07Cn0KCm1vZHVsZS5leHBvcnRzID0geyBvYnNlcnZlV29ya2VyLCBwcmVzZXJ2ZUFmdGVyV29ya2VyIH07Cg=='))
+          $candidateCollector = Join-Path $root 'candidate-collector.cjs'
+          [IO.File]::WriteAllBytes($candidateCollector,[Convert]::FromBase64String('Y29uc3QgZnM9cmVxdWlyZSgnbm9kZTpmcy9wcm9taXNlcycpLHBhdGg9cmVxdWlyZSgnbm9kZTpwYXRoJyksYXNzZXJ0PXJlcXVpcmUoJ25vZGU6YXNzZXJ0L3N0cmljdCcpOwpjb25zdCB7RGF0YWJhc2VTeW5jfT1yZXF1aXJlKCdub2RlOnNxbGl0ZScpOwpjb25zdCB7cHJlc2VydmVBZnRlcldvcmtlcn09cmVxdWlyZSgnLi9jYW5kaWRhdGUtYm91bmRhcnkuY2pzJyk7CmNvbnN0IFtwYXJlbnQsc2VhbGVkLHBpZCxleGl0Q29kZV09cHJvY2Vzcy5hcmd2LnNsaWNlKDIpOwooYXN5bmMoKT0+ewogIGNvbnN0IHNlc3Npb249cGF0aC5qb2luKHBhcmVudCwnZjM4Ny1jbGVhbnVwLXNvbHV0aW9uLWNvbGxlY3RvcicpOwogIGF3YWl0IGZzLm1rZGlyKHNlc3Npb24pOwogIGNvbnN0IGZpeHR1cmU9cGF0aC5qb2luKHNlc3Npb24sJ2RiLXYwOTAtbGlmdC1yZXRhaW5lZCcpO2F3YWl0IGZzLm1rZGlyKGZpeHR1cmUpOwogIGZvcihjb25zdCBuYW1lIG9mIFsnY29udmVyc2F0aW9ucy5kYicsJ2NvbnZlcnNhdGlvbnMuZGItd2FsJywnY29udmVyc2F0aW9ucy5kYi1zaG0nXSkgewogICAgdHJ5e2F3YWl0IGZzLmNvcHlGaWxlKHBhdGguam9pbihzZWFsZWQsbmFtZSkscGF0aC5qb2luKGZpeHR1cmUsbmFtZSksZnMuY29uc3RhbnRzLkNPUFlGSUxFX0VYQ0wpO30KICAgIGNhdGNoKGVycm9yKXtpZihlcnJvci5jb2RlIT09J0VOT0VOVCd8fG5hbWU9PT0nY29udmVyc2F0aW9ucy5kYicpdGhyb3cgZXJyb3I7fQogIH0KICBjb25zdCBjbG9zZWQ9e3BpZDpOdW1iZXIocGlkKSxleGl0Q29kZTpOdW1iZXIoZXhpdENvZGUpLHNpZ25hbDpudWxsLG9ic2VydmVkQXQ6bmV3IERhdGUoKS50b0lTT1N0cmluZygpLGFkYXB0ZXI6J1Bvd2VyU2hlbGwgU3RhcnQtUHJvY2VzcyAtV2FpdCAtUGFzc1RocnUgcmV0dXJuZWQgbmF0dXJhbGx5J307CiAgYXNzZXJ0LmVxdWFsKGNsb3NlZC5leGl0Q29kZSwwKTsKICBsZXQgc25hcHNob3RWZXJpZmllZD1mYWxzZTsKICB0cnkgewogICAgYXdhaXQgcHJlc2VydmVBZnRlcldvcmtlcih7d29ya2VyQ2xvc2VkOlByb21pc2UucmVzb2x2ZShjbG9zZWQpLHNlc3Npb25Sb290OnNlc3Npb24sZml4dHVyZURpcmVjdG9yeTpmaXh0dXJlLGV2aWRlbmNlRGlyZWN0b3J5OnBhdGguam9pbihzZXNzaW9uLCdzZWFsZWQnKSwKICAgICAgdmFsaWRhdGVTbmFwc2hvdDphc3luYyh7ZXZpZGVuY2VEaXJlY3Rvcnl9KT0+ewogICAgICAgIGNvbnN0IHJlc3RvcmU9cGF0aC5qb2luKHNlc3Npb24sJ3Jlc3RvcmUnKTthd2FpdCBmcy5ta2RpcihyZXN0b3JlKTsKICAgICAgICBmb3IoY29uc3QgbmFtZSBvZiBbJ2NvbnZlcnNhdGlvbnMuZGInLCdjb252ZXJzYXRpb25zLmRiLXdhbCcsJ2NvbnZlcnNhdGlvbnMuZGItc2htJ10pewogICAgICAgICAgdHJ5e2F3YWl0IGZzLmNvcHlGaWxlKHBhdGguam9pbihldmlkZW5jZURpcmVjdG9yeSxuYW1lKSxwYXRoLmpvaW4ocmVzdG9yZSxuYW1lKSxmcy5jb25zdGFudHMuQ09QWUZJTEVfRVhDTCk7fQogICAgICAgICAgY2F0Y2goZXJyb3Ipe2lmKGVycm9yLmNvZGUhPT0nRU5PRU5UJ3x8bmFtZT09PSdjb252ZXJzYXRpb25zLmRiJyl0aHJvdyBlcnJvcjt9CiAgICAgICAgfQogICAgICAgIGNvbnN0IGRiPW5ldyBEYXRhYmFzZVN5bmMocGF0aC5qb2luKHJlc3RvcmUsJ2NvbnZlcnNhdGlvbnMuZGInKSk7CiAgICAgICAgdHJ5ewogICAgICAgICAgYXNzZXJ0LmVxdWFsKGRiLnByZXBhcmUoJ1BSQUdNQSBpbnRlZ3JpdHlfY2hlY2snKS5nZXQoKS5pbnRlZ3JpdHlfY2hlY2ssJ29rJyk7CiAgICAgICAgICBhc3NlcnQuZXF1YWwoZGIucHJlcGFyZSgnUFJBR01BIHVzZXJfdmVyc2lvbicpLmdldCgpLnVzZXJfdmVyc2lvbiw3KTsKICAgICAgICAgIGFzc2VydC5kZWVwRXF1YWwoZGIucHJlcGFyZSgnU0VMRUNUIGlkLHRpdGxlLGFjdGl2ZVJvb3RJZCBGUk9NIENvbnZlcnNhdGlvbiBPUkRFUiBCWSBpZCcpLmFsbCgpLm1hcCh4PT4oey4uLnh9KSksW3tpZDonY29udi1sZWdhY3knLHRpdGxlOidCZWZvcmUgdGhlIGhlYWQnLGFjdGl2ZVJvb3RJZDpudWxsfV0pOwogICAgICAgICAgYXNzZXJ0LmRlZXBFcXVhbChkYi5wcmVwYXJlKCdTRUxFQ1QgaWQsY29udGVudCxwYXJlbnRJZCxhY3RpdmVDaGlsZElkIEZST00gTWVzc2FnZSBPUkRFUiBCWSBpZCcpLmFsbCgpLm1hcCh4PT4oey4uLnh9KSksW3tpZDonbXNnLWxlZ2FjeScsY29udGVudDonS2VwdCBhY3Jvc3MgdGhlIGxpZnQnLHBhcmVudElkOm51bGwsYWN0aXZlQ2hpbGRJZDpudWxsfV0pOwogICAgICAgIH1maW5hbGx5e2RiLmNsb3NlKCk7fQogICAgICAgIHNuYXBzaG90VmVyaWZpZWQ9dHJ1ZTtyZXR1cm57aW50ZWdyaXR5Oidvaycsc2NoZW1hQW5kUm93c1ZlcmlmaWVkOnRydWV9OwogICAgICB9LAogICAgICBhY2tub3dsZWRnZUFydGlmYWN0OmFzeW5jKCk9Pntjb25zdCBlcnJvcj1uZXcgRXJyb3IoJ0FydGlmYWN0IHZlcmlmaWNhdGlvbiBvY2N1cnMgb24gYSBmcmVzaCBydW5uZXI7IG5vIGNsZWFudXAgY2FwYWJpbGl0eSBtYXkgYmUgaXNzdWVkIGhlcmUnKTtlcnJvci5jb2RlPSdBQ0tfREVGRVJSRUQnO3Rocm93IGVycm9yO30KICAgIH0pOwogICAgdGhyb3cgbmV3IEVycm9yKCdDbGVhbnVwIGNhcGFiaWxpdHkgdW5leHBlY3RlZGx5IHJldHVybmVkIHdpdGhvdXQgcmVtb3RlIGFja25vd2xlZGdlbWVudCcpOwogIH1jYXRjaChlcnJvcil7aWYoZXJyb3IuY29kZSE9PSdBQ0tfREVGRVJSRUQnKXRocm93IGVycm9yO30KICBhc3NlcnQoc25hcHNob3RWZXJpZmllZCk7CiAgY29uc3Qgc3RhdGU9e2NhbmRpZGF0ZUFwcGxpZWQ6dHJ1ZSxuYXR1cmFsRXhpdDpjbG9zZWQsc25hcHNob3RWZXJpZmllZCxyZW1vdGVBY2tub3dsZWRnZW1lbnQ6J3BlbmRpbmcgaW5kZXBlbmRlbnQgZG93bmxvYWQvcmVzdG9yZSBqb2InLGNsZWFudXBDYXBhYmlsaXR5SXNzdWVkOmZhbHNlLG1hbnVhbERlbGV0aW9uUGVyZm9ybWVkOmZhbHNlLHNvdXJjZUFuZFNlYWxlZFByZXNlcnZlZDp0cnVlLGFkYXB0ZXI6J1Jlc3RyaWN0ZWQgd29ya2VyIHVzZXMgdGhlIGNhbmRpZGF0ZSBmaXh0dXJlIGhlbHBlcjsgY29sbGVjdG9yIHVzZXMgdGhlIHVuY2hhbmdlZCBjYW5kaWRhdGUgYm91bmRhcnkgbW9kdWxlIG9uIGEgcHJvdGVjdGVkIHBvc3QtZXhpdCBjb3B5LiBDYW5kaWRhdGUgTm9kZSBwcm9jZXNzIGxhdW5jaGVyIGlzIHJlcGxhY2VkIGJ5IHRoZSBleGlzdGluZyBXaW5kb3dzIGlkZW50aXR5IGFkYXB0ZXIuJ307CiAgYXdhaXQgZnMuY29weUZpbGUocGF0aC5qb2luKHNlc3Npb24sJ3NlYWxlZCcsJ21hbmlmZXN0Lmpzb24nKSxwYXRoLmpvaW4oc2VhbGVkLCdjYW5kaWRhdGUtYm91bmRhcnktbWFuaWZlc3QuanNvbicpLGZzLmNvbnN0YW50cy5DT1BZRklMRV9FWENMKTsKICBhd2FpdCBmcy53cml0ZUZpbGUocGF0aC5qb2luKHNlYWxlZCwnY2FuZGlkYXRlLWJvdW5kYXJ5LXN0YXRlLmpzb24nKSxKU09OLnN0cmluZ2lmeShzdGF0ZSxudWxsLDIpLHtmbGFnOid3eCd9KTsKICBjb25zb2xlLmxvZyhKU09OLnN0cmluZ2lmeShzdGF0ZSkpOwp9KSgpLmNhdGNoKGVycm9yPT57Y29uc29sZS5lcnJvcihlcnJvcik7cHJvY2Vzcy5leGl0Q29kZT0xO30pOw=='))
+          & $node $candidateCollector $root $sealed.FullName $proc.Id $proc.ExitCode
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate boundary integration failed; source retained' }
           $inventory = @(Get-ChildItem -LiteralPath $sealed.FullName -File | Sort-Object Name | ForEach-Object { [ordered]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()} })
           $manifest = Join-Path $sealed.FullName 'manifest.json'
           [ordered]@{runId=$runId;mode=$env:F387_GC_MODE;workerSid=$worker.SID.Value;collectorSid=$collector.Value;exitCode=$proc.ExitCode;sourceSha='91daf54c96935a8b69a84d4f364a831ccf120d61';files=$inventory} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifest -Encoding utf8
           "sealed=$($sealed.FullName)" >> $env:GITHUB_OUTPUT
           "manifest_sha=$((Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          "manifest_sha_$env:F387_GC_MODE=$((Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Output "ID 88 worker exit $($proc.ExitCode); original synthetic fixture is retained"
       - name: Upload only sealed ID 88 evidence
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-candidate
           path: |
             ${{ steps.seal.outputs.sealed }}/manifest.json
             ${{ steps.seal.outputs.sealed }}/worker.stdout.txt
             ${{ steps.seal.outputs.sealed }}/worker.stderr.txt
-            ${{ steps.seal.outputs.sealed }}/worker-handoff.json
-            ${{ steps.seal.outputs.sealed }}/pre-cleanup.json
+            ${{ steps.seal.outputs.sealed }}/fixture-handoff.json
+            ${{ steps.seal.outputs.sealed }}/candidate-boundary-state.json
+            ${{ steps.seal.outputs.sealed }}/candidate-boundary-manifest.json
             ${{ steps.seal.outputs.sealed }}/after-exit.json
             ${{ steps.seal.outputs.sealed }}/result.json
-            ${{ steps.seal.outputs.sealed }}/lifecycle.jsonl
             ${{ steps.seal.outputs.sealed }}/conversations.db
             ${{ steps.seal.outputs.sealed }}/conversations.db-wal
             ${{ steps.seal.outputs.sealed }}/conversations.db-shm
@@ -986,10 +269,6 @@ jobs:
           overwrite: false
 
   id88_verify:
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [wait, gc]
     needs: id88
     if: ${{ always() && needs.id88.outputs.archive_id != '' }}
     runs-on: windows-2022
@@ -998,13 +277,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-candidate
           path: ${{ runner.temp }}/id88-download-${{ env.F386_RUN }}
       - name: Verify the one selected result and restore a fresh copy
         shell: pwsh
         env:
-          MANIFEST_SHA: ${{ needs.id88.outputs[format('manifest_sha_{0}', matrix.mode)] }}
-          EXPECTED_MODE: ${{ matrix.mode }}
+          MANIFEST_SHA: ${{ needs.id88.outputs.manifest_sha }}
+          EXPECTED_MODE: candidate
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -1013,7 +292,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
           $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           if ($doc.runId -cne "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-id88" -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
-          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','after-exit.json','result.json','lifecycle.jsonl','conversations.db','conversations.db-wal','conversations.db-shm')
+          $allowed = @('worker.stdout.txt','worker.stderr.txt','fixture-handoff.json','candidate-boundary-state.json','candidate-boundary-manifest.json','after-exit.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
           foreach ($f in $doc.files) {
             if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
             $p = Join-Path $dir $f.name
@@ -1021,17 +300,15 @@ jobs:
           }
           if (@(Compare-Object @($doc.files.name + 'manifest.json' | Sort-Object) @(Get-ChildItem -LiteralPath $dir -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Archive inventory mismatch' }
           if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
-          $events=@(Get-Content -LiteralPath (Join-Path $dir 'lifecycle.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
-          $close=@($events | Where-Object event -ceq 'native.close.return')
-          $disconnect=@($events | Where-Object event -ceq 'prisma.disconnect.resolved')
-          if ($close.Count -lt 2 -or $disconnect.Count -lt 2) { throw 'Lifecycle instrumentation absent' }
-          if ($doc.mode -cne $env:EXPECTED_MODE) { throw 'Matrix mode mismatch' }
-          $gcBegin=@($events | Where-Object event -ceq 'intervention.begin')
-          $gcProbe=@($events | Where-Object event -ceq 'gc.probe.complete')
-          $cleanupProbe=@($events | Where-Object event -ceq 'cleanup.probe.complete')
-          if ($gcBegin.Count -ne 1 -or $gcProbe.Count -ne 1 -or $cleanupProbe.Count -ne 1 -or $gcBegin[0].pid -ne $gcProbe[0].pid -or $gcProbe[0].pid -ne $cleanupProbe[0].pid) { throw 'GC scope or same-process identity not verified' }
-          foreach ($event in $events | Where-Object { $_.event -notin @('statement.prepared','statement.wrapper-finalized') }) { Write-Output ('Lifecycle '+($event | ConvertTo-Json -Compress)) }
-          Write-Output ('Statement counts '+(@($events | Group-Object event | Select-Object Name,Count) | ConvertTo-Json -Compress))
+          $state = Get-Content -LiteralPath (Join-Path $dir 'candidate-boundary-state.json') -Raw | ConvertFrom-Json
+          $boundary = Get-Content -LiteralPath (Join-Path $dir 'candidate-boundary-manifest.json') -Raw | ConvertFrom-Json
+          if ($doc.mode -cne 'candidate' -or -not $state.candidateApplied -or -not $state.snapshotVerified -or $state.cleanupCapabilityIssued -or $state.manualDeletionPerformed -or $state.naturalExit.exitCode -ne 0 -or $boundary.mode -cne 'post-natural-exit') { throw 'Candidate integration state invalid' }
+          foreach ($f in $boundary.files) {
+            $outer = @($doc.files | Where-Object name -ceq $f.name)
+            if ($outer.Count -ne 1 -or $outer[0].sha256 -cne $f.sha256 -or $outer[0].bytes -ne $f.bytes) { throw 'Boundary snapshot does not match preserved original bytes' }
+          }
+          Write-Output ('Candidate boundary '+($state | ConvertTo-Json -Depth 8 -Compress))
+
           $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
           $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
           if ($ran.Count -ne 1 -or $ran[0].title -cne 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data' -or @($ran[0].ancestorTitles)[-1] -cne 'schema boot after the plan-36 flatten') { throw 'Exact one-case scope not verified' }
@@ -1063,91 +340,3 @@ jobs:
           node $script $dir
 
 
-  id88_retained_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Verify retained ID 88 artifact only'
-    runs-on: windows-2022
-    permissions:
-      actions: read
-    timeout-minutes: 5
-    steps:
-      - name: Confirm identity of the existing archive
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $artifact = Invoke-RestMethod -TimeoutSec 15 -Uri 'https://api.github.com/repos/seanchc418/desktop-assistant/actions/artifacts/14885200867'
-          if ($artifact.id -ne 14885200867 -or $artifact.name -cne 'id88-45313913893-1' -or $artifact.expired -or $artifact.workflow_run.id -ne 45313913893 -or $artifact.workflow_run.head_sha -cne 'fdf46b2eaed4335740585387e5bff37a3b394ce7' -or $artifact.digest -cne 'sha256:f3e971027055b684c34a19a6f923cb8e572a1b818b2b7f680332e197522aa5ee') { throw 'Original archive identity mismatch' }
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: id88-45313913893-1
-          run-id: 45313913893
-          repository: seanchc418/desktop-assistant
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/id88-download-${{ env.F386_RUN }}
-      - name: Verify the preserved report and restore only a fresh copy
-        shell: pwsh
-        env:
-          MANIFEST_SHA: 7b799d2a7e393e03316fa1b8ddc5551918a36b515b4eb76900f44d9c2f9d332f
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $dir = Join-Path $env:RUNNER_TEMP "id88-download-$env:F386_RUN"
-          $manifest = Join-Path $dir 'manifest.json'
-          if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
-          $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-          if ($doc.runId -cne '45313913893-1-id88' -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
-          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
-          foreach ($f in $doc.files) {
-            if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
-            $p = Join-Path $dir $f.name
-            if ((Get-Item -LiteralPath $p).Length -ne $f.bytes -or (Get-FileHash -LiteralPath $p).Hash -ine $f.sha256) { throw 'File mismatch' }
-          }
-          if (@(Compare-Object @($doc.files.name + 'manifest.json' | Sort-Object) @(Get-ChildItem -LiteralPath $dir -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Archive inventory mismatch' }
-          if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
-          $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
-          $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
-          $suite = 'schema boot after the plan-36 flatten'
-          $case = 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
-          if ($ran.Count -ne 1 -or $ran[0].title -cne $case -or @($ran[0].ancestorTitles)[-1] -cne $suite -or $result.numPassedTests -ne 1 -or $result.numPendingTests -ne 12) { throw 'Exact one-case scope not verified' }
-          if (@($result.testResults).Count -ne 1 -or $result.testResults[0].name -cnotmatch '[\\/]tests[\\/]database-migration\.test\.ts$') { throw 'Unexpected test file' }
-          Write-Output "Verified JSON case: $suite > $case"
-          Write-Output "ID 88 outcome $($ran[0].status); skipped $($result.numPendingTests); worker exit $($doc.exitCode)"
-          $probe = Get-Content -LiteralPath (Join-Path $dir 'pre-cleanup.json') -Raw | ConvertFrom-Json
-          $handoff = Get-Content -LiteralPath (Join-Path $dir 'worker-handoff.json') -Raw | ConvertFrom-Json
-          if (-not $probe.recursiveRemovalSuppressed -or $probe.pid -ne $handoff.pid -or $handoff.runId -cne $doc.runId) { throw 'Unexpected probe provenance' }
-          Write-Output ('Win32 probe ' + ($probe | ConvertTo-Json -Depth 8 -Compress))
-          if ($ran[0].status -ne 'passed' -or $doc.exitCode -ne 0) { throw 'ID 88 did not pass; original evidence retained' }
-          $script = Join-Path $env:RUNNER_TEMP 'f387-id88-restore.cjs'
-          @'
-          const fs=require('node:fs'); const path=require('node:path'); const os=require('node:os');
-          const assert=require('node:assert/strict'); const {DatabaseSync}=require('node:sqlite');
-          const input=process.argv[2]; const root=fs.mkdtempSync(path.join(os.tmpdir(),'id88-restore-'));
-          for (const name of ['conversations.db','conversations.db-wal','conversations.db-shm']) {
-            const p=path.join(input,name);
-            if (name==='conversations.db'||fs.existsSync(p)) fs.copyFileSync(p,path.join(root,name),fs.constants.COPYFILE_EXCL);
-          }
-          const db=new DatabaseSync(path.join(root,'conversations.db'));
-          try {
-            const integrity=db.prepare('PRAGMA integrity_check').get().integrity_check;
-            const version=db.prepare('PRAGMA user_version').get().user_version;
-            const conversation=db.prepare("SELECT id,title,activeRootId FROM Conversation WHERE id='conv-legacy'").get();
-            const message=db.prepare("SELECT id,content,parentId,activeChildId FROM Message WHERE id='msg-legacy'").get();
-            assert.equal(integrity,'ok'); assert.equal(version,7);
-            assert.deepEqual({...conversation},{id:'conv-legacy',title:'Before the head',activeRootId:null});
-            assert.deepEqual({...message},{id:'msg-legacy',content:'Kept across the lift',parentId:null,activeChildId:null});
-            console.log(JSON.stringify({integrity,version,conversation,message}));
-          } finally { db.close(); }
-          '@ | Set-Content -LiteralPath $script -Encoding utf8
-          node $script $dir
-          $check = Join-Path $env:RUNNER_TEMP 'f387-win32-evidence.cjs'
-          @'
-          const assert = require('node:assert/strict');
-          const fs = require('node:fs');
-          const probe = JSON.parse(fs.readFileSync(process.argv[2],'utf8').replace(/^\uFEFF/,''));
-          const rows = probe.observation;
-          assert(Array.isArray(rows) && rows.length === 3);
-          assert.deepEqual(rows.map(x=>x.name).sort(),['conversations.db','conversations.db-shm','conversations.db-wal']);
-          for (const row of rows) assert(Number.isInteger(row.readWin32) && Number.isInteger(row.deleteAccessWin32));
-          console.log('Verified preserved Win32 readings '+JSON.stringify(rows));
-          '@ | Set-Content -LiteralPath $check -Encoding utf8
-          node $check (Join-Path $dir 'pre-cleanup.json')
-          Write-Output 'Verified original artifact only; no Vitest invocation'
