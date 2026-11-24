@@ -726,7 +726,7 @@ jobs:
             assert.equal(text.split(from).length,2,'Instrumentation anchor mismatch');
             fs.writeFileSync(file,text.replace(from,()=>to));
           };
-          const helper = `
+          const helper = String.raw`
           const fsTrace = require('node:fs');
           const pathTrace = require('node:path');
           function life(event,data={}) {
@@ -745,7 +745,7 @@ jobs:
           `;
           fs.appendFileSync(path.join(repo,'node_modules/libsql/index.js'),helper);
           const open=path.join(repo,'src/main/db/open.ts');
-          replace(open,'  await prisma.$connect();',`  const trace = (event: string) => { const root=process.env.F387_DIAGNOSTIC_ROOT; if(root) require('node:fs').appendFileSync(require('node:path').join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),pid:process.pid,event})+'\n'); };
+          replace(open,'  await prisma.$connect();',String.raw`  const trace = (event: string) => { const root=process.env.F387_DIAGNOSTIC_ROOT; if(root) require('node:fs').appendFileSync(require('node:path').join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),pid:process.pid,event})+'\n'); };
             const disconnect=prisma.$disconnect.bind(prisma);
             prisma.$disconnect=async () => { trace('prisma.disconnect.begin'); try { await disconnect(); trace('prisma.disconnect.resolved'); } catch(error){trace('prisma.disconnect.error');throw error;} };
             trace('prisma.connect.begin');
