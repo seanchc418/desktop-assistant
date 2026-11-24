@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -940,3 +940,85 @@ jobs:
           } finally { db.close(); }
           '@ | Set-Content -LiteralPath $script -Encoding utf8
           node $script $dir
+
+
+  id88_retained_verify:
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Verify retained ID 88 artifact only'
+    runs-on: windows-2022
+    permissions:
+      actions: read
+    timeout-minutes: 5
+    steps:
+      - name: Confirm identity of the existing archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifact = Invoke-RestMethod -TimeoutSec 15 -Uri 'https://api.github.com/repos/seanchc418/desktop-assistant/actions/artifacts/14885200867'
+          if ($artifact.id -ne 14885200867 -or $artifact.name -cne 'id88-45313913893-1' -or $artifact.expired -or $artifact.workflow_run.id -ne 45313913893 -or $artifact.workflow_run.head_sha -cne 'fdf46b2eaed4335740585387e5bff37a3b394ce7' -or $artifact.digest -cne 'sha256:f3e971027055b684c34a19a6f923cb8e572a1b818b2b7f680332e197522aa5ee') { throw 'Original archive identity mismatch' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: id88-45313913893-1
+          run-id: 45313913893
+          repository: seanchc418/desktop-assistant
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/id88-download-${{ env.F386_RUN }}
+      - name: Verify the preserved report and restore only a fresh copy
+        shell: pwsh
+        env:
+          MANIFEST_SHA: 7b799d2a7e393e03316fa1b8ddc5551918a36b515b4eb76900f44d9c2f9d332f
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dir = Join-Path $env:RUNNER_TEMP "id88-download-$env:F386_RUN"
+          $manifest = Join-Path $dir 'manifest.json'
+          if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
+          $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if ($doc.runId -cne '45313913893-1-id88' -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
+          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
+          foreach ($f in $doc.files) {
+            if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
+            $p = Join-Path $dir $f.name
+            if ((Get-Item -LiteralPath $p).Length -ne $f.bytes -or (Get-FileHash -LiteralPath $p).Hash -ine $f.sha256) { throw 'File mismatch' }
+          }
+          if (@(Compare-Object @($doc.files.name + 'manifest.json' | Sort-Object) @(Get-ChildItem -LiteralPath $dir -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Archive inventory mismatch' }
+          if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
+          $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
+          $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
+          $suite = 'schema boot after the plan-36 flatten'
+          $case = 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
+          if ($ran.Count -ne 1 -or $ran[0].title -cne $case -or @($ran[0].ancestorTitles)[-1] -cne $suite -or $result.numPassedTests -ne 1 -or $result.numPendingTests -ne 12) { throw 'Exact one-case scope not verified' }
+          if (@($result.testResults).Count -ne 1 -or $result.testResults[0].name -cnotmatch '[\\/]tests[\\/]database-migration\.test\.ts$') { throw 'Unexpected test file' }
+          Write-Output "Verified JSON case: $suite > $case"
+          Write-Output "ID 88 outcome $($ran[0].status); skipped $($result.numPendingTests); worker exit $($doc.exitCode)"
+          $probe = Get-Content -LiteralPath (Join-Path $dir 'pre-cleanup.json') -Raw | ConvertFrom-Json
+          $handoff = Get-Content -LiteralPath (Join-Path $dir 'worker-handoff.json') -Raw | ConvertFrom-Json
+          if (-not $probe.recursiveRemovalSuppressed -or $probe.pid -ne $handoff.pid -or $handoff.runId -cne $doc.runId) { throw 'Unexpected probe provenance' }
+          Write-Output ('Win32 probe ' + ($probe | ConvertTo-Json -Depth 8 -Compress))
+          if ($ran[0].status -ne 'passed' -or $doc.exitCode -ne 0) { throw 'ID 88 did not pass; original evidence retained' }
+          $script = Join-Path $env:RUNNER_TEMP 'f387-id88-restore.cjs'
+          @'
+          const fs=require('node:fs'); const path=require('node:path'); const os=require('node:os');
+          const assert=require('node:assert/strict'); const {DatabaseSync}=require('node:sqlite');
+          const input=process.argv[2]; const root=fs.mkdtempSync(path.join(os.tmpdir(),'id88-restore-'));
+          for (const name of ['conversations.db','conversations.db-wal','conversations.db-shm']) {
+            const p=path.join(input,name);
+            if (name==='conversations.db'||fs.existsSync(p)) fs.copyFileSync(p,path.join(root,name),fs.constants.COPYFILE_EXCL);
+          }
+          const db=new DatabaseSync(path.join(root,'conversations.db'));
+          try {
+            const integrity=db.prepare('PRAGMA integrity_check').get().integrity_check;
+            const version=db.prepare('PRAGMA user_version').get().user_version;
+            const conversation=db.prepare("SELECT id,title,activeRootId FROM Conversation WHERE id='conv-legacy'").get();
+            const message=db.prepare("SELECT id,content,parentId,activeChildId FROM Message WHERE id='msg-legacy'").get();
+            assert.equal(integrity,'ok'); assert.equal(version,7);
+            assert.deepEqual({...conversation},{id:'conv-legacy',title:'Before the head',activeRootId:null});
+            assert.deepEqual({...message},{id:'msg-legacy',content:'Kept across the lift',parentId:null,activeChildId:null});
+            console.log(JSON.stringify({integrity,version,conversation,message}));
+          } finally { db.close(); }
+          '@ | Set-Content -LiteralPath $script -Encoding utf8
+          node $script $dir
+          if (@($probe.observation).Count -ne 3 -or $probe.observation.probeError -or @($probe.observation | Where-Object { $_.name -ceq 'conversations.db' }).Count -ne 1) { throw 'Restored successfully; Win32 handle probe unavailable' }
+          $probeNames = @($probe.observation | Select-Object -ExpandProperty name | Sort-Object)
+          if (@(Compare-Object $probeNames @('conversations.db','conversations.db-shm','conversations.db-wal') -CaseSensitive).Count) { throw 'Probe file set mismatch' }
+          foreach ($row in $probe.observation) { if ($row.readWin32 -isnot [long] -and $row.readWin32 -isnot [int]) { throw 'Win32 read value missing' }; if ($row.deleteAccessWin32 -isnot [long] -and $row.deleteAccessWin32 -isnot [int]) { throw 'Win32 delete-access value missing' } }
+          Write-Output 'Verified original artifact only; no Vitest invocation'
