@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -637,7 +637,7 @@ jobs:
           overwrite: false
 
   id88:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Run approved ID 88 diagnostic once' && github.run_attempt == 1
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Trace approved ID 88 file holders once' && github.run_attempt == 1
     runs-on: windows-2022
     permissions:
       contents: read
@@ -771,6 +771,42 @@ jobs:
           using System.Runtime.InteropServices;
           using Microsoft.Win32.SafeHandles;
           public static class ID88Access {
+            [StructLayout(LayoutKind.Sequential)] public struct Unique { public int pid; public System.Runtime.InteropServices.ComTypes.FILETIME start; }
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct Info {
+              public Unique Process;
+              [MarshalAs(UnmanagedType.ByValTStr,SizeConst=256)] public string AppName;
+              [MarshalAs(UnmanagedType.ByValTStr,SizeConst=64)] public string Service;
+              public uint Type; public uint Status; public uint Session;
+              [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
+            }
+            public class Owner { public int pid; public string processName; public string startUtc; }
+            public class OwnerResult { public int error; public Owner[] owners; }
+            [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern int RmStartSession(out uint s,uint flags,System.Text.StringBuilder key);
+            [DllImport("rstrtmgr.dll",CharSet=CharSet.Unicode)] static extern int RmRegisterResources(uint s,uint n,string[] files,uint np,IntPtr p,uint ns,IntPtr services);
+            [DllImport("rstrtmgr.dll")] static extern int RmGetList(uint s,out uint needed,ref uint count,[In,Out] Info[] info,ref uint reasons);
+            [DllImport("rstrtmgr.dll")] static extern int RmEndSession(uint s);
+            public static OwnerResult Owners(string file) {
+              uint session; int err=RmStartSession(out session,0,new System.Text.StringBuilder(33));
+              if(err!=0) return new OwnerResult{error=err,owners=new Owner[0]};
+              try {
+                err=RmRegisterResources(session,1,new string[]{file},0,IntPtr.Zero,0,IntPtr.Zero);
+                if(err!=0) return new OwnerResult{error=err,owners=new Owner[0]};
+                uint needed=0,count=0,reasons=0; Info[] info=null;
+                err=RmGetList(session,out needed,ref count,info,ref reasons);
+                for(int retry=0;err==234 && retry<3;retry++) {
+                  count=needed; info=new Info[count]; err=RmGetList(session,out needed,ref count,info,ref reasons);
+                }
+                if(err!=0) return new OwnerResult{error=err,owners=new Owner[0]};
+                var list=new System.Collections.Generic.List<Owner>();
+                for(int i=0;i<count;i++) {
+                  string name=info[i].AppName;
+                  try { using(var p=System.Diagnostics.Process.GetProcessById(info[i].Process.pid)) { name=p.ProcessName; } } catch {}
+                  long time=((long)(uint)info[i].Process.start.dwHighDateTime<<32)|(uint)info[i].Process.start.dwLowDateTime;
+                  list.Add(new Owner{pid=info[i].Process.pid,processName=name,startUtc=DateTime.FromFileTimeUtc(time).ToString("o")});
+                }
+                return new OwnerResult{error=0,owners=list.ToArray()};
+              } finally { RmEndSession(session); }
+            }
             [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
             private static extern SafeFileHandle CreateFile(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
             public static int Probe(string p,uint a) {
@@ -782,9 +818,9 @@ jobs:
           "@
           $rows = foreach ($name in 'conversations.db','conversations.db-wal','conversations.db-shm') {
             $p = Join-Path $Directory $name
-            [ordered]@{ name=$name; readWin32=[ID88Access]::Probe($p,1); deleteAccessWin32=[ID88Access]::Probe($p,65536) }
+            [ordered]@{ name=$name; readWin32=[ID88Access]::Probe($p,1); deleteAccessWin32=[ID88Access]::Probe($p,65536); restartManager=[ID88Access]::Owners($p) }
           }
-          ConvertTo-Json -InputObject @($rows) -Compress
+          ConvertTo-Json -InputObject @($rows) -Depth 8 -Compress
           '@ | Set-Content -LiteralPath $probe -Encoding utf8
           @'
           import path from 'node:path';
@@ -838,6 +874,10 @@ jobs:
             if ($h.runId -cne $runId -or $h.dir -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$') { throw 'Invalid handoff' }
             $directory = Get-Item -LiteralPath (Join-Path $temp.FullName $h.dir) -Force
             if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid source directory' }
+            $after = & (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') -NoProfile -NonInteractive -File $probe $directory.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'Post-exit probe failed' }
+            Set-Content -LiteralPath (Join-Path $sealed.FullName 'after-exit.json') -Value $after -Encoding utf8
+            Write-Output ('Post-exit file owners '+$after)
             foreach ($name in 'conversations.db','conversations.db-wal','conversations.db-shm') {
               $candidate = Join-Path $directory.FullName $name
               if (Test-Path -LiteralPath $candidate) { $sources[$name] = $candidate }
@@ -872,6 +912,7 @@ jobs:
             ${{ steps.seal.outputs.sealed }}/worker.stderr.txt
             ${{ steps.seal.outputs.sealed }}/worker-handoff.json
             ${{ steps.seal.outputs.sealed }}/pre-cleanup.json
+            ${{ steps.seal.outputs.sealed }}/after-exit.json
             ${{ steps.seal.outputs.sealed }}/result.json
             ${{ steps.seal.outputs.sealed }}/conversations.db
             ${{ steps.seal.outputs.sealed }}/conversations.db-wal
@@ -903,7 +944,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
           $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           if ($doc.runId -cne "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-id88" -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
-          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
+          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','after-exit.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
           foreach ($f in $doc.files) {
             if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
             $p = Join-Path $dir $f.name
@@ -913,8 +954,8 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
           $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
           $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
-          $expectedCase = 'schema boot after the plan-36 flatten > lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
-          if ($ran.Count -ne 1 -or $ran[0].fullName -cne $expectedCase) { throw 'Exact one-case scope not verified' }
+          if ($ran.Count -ne 1 -or $ran[0].title -cne 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data' -or @($ran[0].ancestorTitles)[-1] -cne 'schema boot after the plan-36 flatten') { throw 'Exact one-case scope not verified' }
+          Write-Output ('After exit '+(Get-Content -LiteralPath (Join-Path $dir 'after-exit.json') -Raw))
           Write-Output "ID 88 outcome $($ran[0].status); skipped $($result.numPendingTests); worker exit $($doc.exitCode)"
           if (Test-Path -LiteralPath (Join-Path $dir 'pre-cleanup.json')) { Get-Content -LiteralPath (Join-Path $dir 'pre-cleanup.json') }
           if ($ran[0].status -ne 'passed' -or $doc.exitCode -ne 0) { throw 'ID 88 did not pass; original evidence retained' }
