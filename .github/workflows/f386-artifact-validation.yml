@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 file holders once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -637,7 +637,7 @@ jobs:
           overwrite: false
 
   id88:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Trace approved ID 88 file holders once' && github.run_attempt == 1
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Trace approved ID 88 lifecycle once' && github.run_attempt == 1
     runs-on: windows-2022
     permissions:
       contents: read
@@ -715,6 +715,46 @@ jobs:
           $config = Join-Path $repo 'f387-id88.config.mjs'
           $launch = Join-Path $repo 'f387-id88-launch.cjs'
           $case = 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
+          $patcher = Join-Path $root 'instrument.cjs'
+          @'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const assert = require('node:assert/strict');
+          const repo = process.argv[2];
+          const replace = (file,from,to) => {
+            const text=fs.readFileSync(file,'utf8').replaceAll('\r\n','\n');
+            assert.equal(text.split(from).length,2,'Instrumentation anchor mismatch');
+            fs.writeFileSync(file,text.replace(from,()=>to));
+          };
+          const helper = `
+          const fsTrace = require('node:fs');
+          const pathTrace = require('node:path');
+          function life(event,data={}) {
+            const root=process.env.F387_DIAGNOSTIC_ROOT;
+            if(root) fsTrace.appendFileSync(pathTrace.join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),hr:process.hrtime.bigint().toString(),pid:process.pid,event,...data})+'\n');
+          }
+          const dbids=new WeakMap(); let dbnext=0; let stmtnext=0;
+          const totals=new Map();
+          const watch=new FinalizationRegistry(data=>{totals.get(data.dbid).finalized++;life('statement.wrapper-finalized',data);});
+          const dbid=db=>{let id=dbids.get(db);if(!id){id=++dbnext;dbids.set(db,id);totals.set(id,{prepared:0,finalized:0});life('database.wrapper-observed',{dbid:id});}return id;};
+          const oldPrepare=Database.prototype.prepare;
+          Database.prototype.prepare=function(...args){const id=dbid(this);const stmt=oldPrepare.apply(this,args);const sid=++stmtnext;totals.get(id).prepared++;watch.register(stmt,{dbid:id,sid});life('statement.prepared',{dbid:id,sid});return stmt;};
+          const oldClose=Database.prototype.close;
+          Database.prototype.close=function(...args){const id=dbid(this);life('native.close.begin',{dbid:id,...totals.get(id)});try{const result=oldClose.apply(this,args);life('native.close.return',{dbid:id,...totals.get(id)});return result;}catch(error){life('native.close.error',{dbid:id,error:String(error)});throw error;}};
+          life('libsql.module.loaded');
+          `;
+          fs.appendFileSync(path.join(repo,'node_modules/libsql/index.js'),helper);
+          const open=path.join(repo,'src/main/db/open.ts');
+          replace(open,'  await prisma.$connect();',`  const trace = (event: string) => { const root=process.env.F387_DIAGNOSTIC_ROOT; if(root) require('node:fs').appendFileSync(require('node:path').join(root,'lifecycle.jsonl'),JSON.stringify({time:new Date().toISOString(),pid:process.pid,event})+'\n'); };
+            const disconnect=prisma.$disconnect.bind(prisma);
+            prisma.$disconnect=async () => { trace('prisma.disconnect.begin'); try { await disconnect(); trace('prisma.disconnect.resolved'); } catch(error){trace('prisma.disconnect.error');throw error;} };
+            trace('prisma.connect.begin');
+            await prisma.$connect();
+            trace('prisma.connect.resolved');`);
+          '@ | Set-Content -LiteralPath $patcher -Encoding utf8
+          $nodePatch = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
+          & $nodePatch $patcher $repo
+          if ($LASTEXITCODE -ne 0) { throw 'Instrumentation source mismatch' }
           $original = (Get-Content -LiteralPath $target -Raw).Replace([string][char]13,'')
           $caseMatch = "  it('$case', async () => {"
           $nextMatch = "  it('lifts an unstamped pre-plan-36"
@@ -761,6 +801,8 @@ jobs:
               observation = JSON.parse(execFileSync(shell,['-NoProfile','-NonInteractive','-File',probe,dir],{encoding:'utf8',windowsHide:true}));
             } catch (error) { observation = { probeError:String(error.message) }; }
             fs.writeFileSync(path.join(tmpdir(),'pre-cleanup.json'),JSON.stringify({startedAt,observedAt:new Date().toISOString(),pid:process.pid,recursiveRemovalSuppressed:true,observation}),{flag:'wx'});
+            const trace=path.join(tmpdir(),'lifecycle.jsonl');
+            fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event:'cleanup.probe.complete'})+'\n');
           }
           '@ | Set-Content -LiteralPath $overlay -Encoding utf8
           @'
@@ -865,7 +907,7 @@ jobs:
           Get-Content -LiteralPath $stderr
           $handoff = Join-Path $temp.FullName 'worker-handoff.json'
           $sources = @{}
-          foreach ($name in 'worker-handoff.json','pre-cleanup.json','result.json') {
+          foreach ($name in 'worker-handoff.json','pre-cleanup.json','result.json','lifecycle.jsonl') {
             $candidate = Join-Path $temp.FullName $name
             if (Test-Path -LiteralPath $candidate) { $sources[$name] = $candidate }
           }
@@ -914,6 +956,7 @@ jobs:
             ${{ steps.seal.outputs.sealed }}/pre-cleanup.json
             ${{ steps.seal.outputs.sealed }}/after-exit.json
             ${{ steps.seal.outputs.sealed }}/result.json
+            ${{ steps.seal.outputs.sealed }}/lifecycle.jsonl
             ${{ steps.seal.outputs.sealed }}/conversations.db
             ${{ steps.seal.outputs.sealed }}/conversations.db-wal
             ${{ steps.seal.outputs.sealed }}/conversations.db-shm
@@ -944,7 +987,7 @@ jobs:
           if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
           $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           if ($doc.runId -cne "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-id88" -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
-          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','after-exit.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
+          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','after-exit.json','result.json','lifecycle.jsonl','conversations.db','conversations.db-wal','conversations.db-shm')
           foreach ($f in $doc.files) {
             if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
             $p = Join-Path $dir $f.name
@@ -952,6 +995,12 @@ jobs:
           }
           if (@(Compare-Object @($doc.files.name + 'manifest.json' | Sort-Object) @(Get-ChildItem -LiteralPath $dir -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Archive inventory mismatch' }
           if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
+          $events=@(Get-Content -LiteralPath (Join-Path $dir 'lifecycle.jsonl') | ForEach-Object { $_ | ConvertFrom-Json })
+          $close=@($events | Where-Object event -ceq 'native.close.return')
+          $disconnect=@($events | Where-Object event -ceq 'prisma.disconnect.resolved')
+          if ($close.Count -lt 2 -or $disconnect.Count -lt 2) { throw 'Lifecycle instrumentation absent' }
+          foreach ($event in $events | Where-Object { $_.event -notin @('statement.prepared','statement.wrapper-finalized') }) { Write-Output ('Lifecycle '+($event | ConvertTo-Json -Compress)) }
+          Write-Output ('Statement counts '+(@($events | Group-Object event | Select-Object Name,Count) | ConvertTo-Json -Compress))
           $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
           $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
           if ($ran.Count -ne 1 -or $ran[0].title -cne 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data' -or @($ran[0].ancestorTitles)[-1] -cne 'schema boot after the plan-36 flatten') { throw 'Exact one-case scope not verified' }
