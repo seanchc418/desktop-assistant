@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Run approved ID 88 diagnostic once'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -635,3 +635,308 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           overwrite: false
+
+  id88:
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Run approved ID 88 diagnostic once' && github.run_attempt == 1
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    timeout-minutes: 16
+    outputs:
+      archive_id: ${{ steps.upload.outputs.artifact-id }}
+      manifest_sha: ${{ steps.seal.outputs.manifest_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 91daf54c96935a8b69a84d4f364a831ccf120d61
+          path: f387-prisma-source
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.22.3'
+          architecture: x64
+      - name: Install locked packages and generate Prisma Client only
+        shell: pwsh
+        working-directory: f387-prisma-source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((git rev-parse HEAD) -cne '91daf54c96935a8b69a84d4f364a831ccf120d61') { throw 'Unexpected source' }
+          $before = (Get-FileHash -LiteralPath 'package-lock.json').Hash
+          if ((node --version) -cne 'v24.22.3' -or (npx.cmd --yes npm@11.6.2 --version) -cne '11.6.2') { throw 'Unexpected toolchain' }
+          npx.cmd --yes npm@11.6.2 ci --ignore-scripts --no-audit --no-fund
+          node node_modules/prisma/build/index.js generate --schema prisma/schema.prisma
+          if (-not (Test-Path -LiteralPath 'src/generated/prisma/client.ts' -PathType Leaf) -or (Get-FileHash -LiteralPath 'package-lock.json').Hash -cne $before) { throw 'Generated client missing or lockfile changed' }
+          Write-Output "F387 setup Node v24.22.3 npm 11.6.2 lockfile SHA-256 $before"
+      - name: Run exactly ID 88 as a non-admin worker and seal allowlisted evidence
+        id: seal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $collector = [Security.Principal.WindowsIdentity]::GetCurrent().User
+          $account = 'f386-' + [guid]::NewGuid().ToString('N').Substring(0,12)
+          $password = ConvertTo-SecureString ('Az9!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))) -AsPlainText -Force
+          $worker = New-LocalUser -Name $account -Password $password -Description 'Disposable synthetic WAL writer'
+          $users = Get-LocalGroup -SID 'S-1-5-32-545'
+          if (-not (Get-LocalGroupMember -Group $users | Where-Object SID -eq $worker.SID)) { Add-LocalGroupMember -Group $users -Member $worker }
+          if ($collector -eq $worker.SID) { throw 'Identity collision' }
+          $root = Join-Path $env:SystemDrive "/f386-chain-$tag"
+          if (Test-Path -LiteralPath $root) { throw 'Workspace already exists' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $acl = [Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetOwner($collector)
+          $acl.SetAccessRuleProtection($true,$false)
+          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          }
+          $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
+          Set-Acl -LiteralPath $root -AclObject $acl
+          $repo = Join-Path $env:GITHUB_WORKSPACE 'f387-prisma-source'
+          $repoAcl = [Security.AccessControl.DirectorySecurity]::new()
+          $repoAcl.SetOwner($collector)
+          $repoAcl.SetAccessRuleProtection($true,$false)
+          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          }
+          $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
+          Set-Acl -LiteralPath $repo -AclObject $repoAcl
+          $inbox = New-Item -ItemType Directory -Path (Join-Path $root 'inbox')
+          $sealed = New-Item -ItemType Directory -Path (Join-Path $root 'sealed')
+          $inboxAcl = Get-Acl -LiteralPath $inbox.FullName
+          $inboxAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'Modify','ContainerInherit,ObjectInherit','None','Allow'))
+          Set-Acl -LiteralPath $inbox.FullName -AclObject $inboxAcl
+          $trial = New-Item -ItemType Directory -Path (Join-Path $inbox.FullName 'id88-trial')
+          $runId = "$tag-id88"
+          $temp = New-Item -ItemType Directory -Path (Join-Path $trial.FullName "f387-id88-$runId")
+          $target = Join-Path $repo 'tests/database-migration.test.ts'
+          $overlay = Join-Path $repo 'tests/f387-id88-handoff.mjs'
+          $probe = Join-Path $repo 'tests/f387-id88-probe.ps1'
+          $config = Join-Path $repo 'f387-id88.config.mjs'
+          $launch = Join-Path $repo 'f387-id88-launch.cjs'
+          $case = 'lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
+          $original = (Get-Content -LiteralPath $target -Raw).Replace([string][char]13,'')
+          $caseMatch = "  it('$case', async () => {"
+          $nextMatch = "  it('lifts an unstamped pre-plan-36"
+          $i = $original.IndexOf($caseMatch,[StringComparison]::Ordinal)
+          $j = $original.IndexOf($nextMatch,$i+1,[StringComparison]::Ordinal)
+          if ($i -lt 0 -or $j -le $i -or $original.LastIndexOf($caseMatch) -ne $i -or $original -match '\b(it|test|describe)\.only\(') { throw 'ID 88 source did not match expected anchors' }
+          $targetBody = $original.Substring($i,$j-$i)
+          $assignment = "    dir = legacyDir;" + [char]10
+          $remove = '      await rm(legacyDir, { recursive: true, force: true });'
+          if (-not $targetBody.Contains($assignment) -or -not $targetBody.Contains($remove)) { throw 'ID 88 cleanup anchors not found' }
+          $targetBody = $targetBody.Replace($caseMatch,"  it.only('$case', async () => {").Replace($assignment,"    registerDiagnostic(legacyDir);" + [char]10).Replace($remove,'      observeAndPreserve(legacyDir);')
+          if ($targetBody -match '\brm\(' -or $targetBody -match '\bdir\s*=\s*legacyDir' -or $targetBody.IndexOf('registerDiagnostic') -ge $targetBody.IndexOf('await openDatabase')) { throw 'Unsafe focused overlay' }
+          $prefix = $original.Substring(0,$i)
+          $hookOriginal = '      await rm(dir, { recursive: true, force: true });'
+          if (-not $prefix.Contains($hookOriginal)) { throw 'Outer cleanup anchor missing' }
+          $prefix = $prefix.Replace($hookOriginal,'      if (!isProtected(dir)) await rm(dir, { recursive: true, force: true });')
+          $import = "import { registerDiagnostic, isProtected, observeAndPreserve } from './f387-id88-handoff.mjs';"
+          Set-Content -LiteralPath $target -Value ($import + [char]10 + $prefix + $targetBody + $original.Substring($j)) -Encoding utf8
+          @'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { tmpdir } from 'node:os';
+          import { execFileSync } from 'node:child_process';
+          import { fileURLToPath } from 'node:url';
+          export function isProtected(dir) { return /^db-v090-lift-[A-Za-z0-9]+$/.test(path.basename(dir)); }
+          export function registerDiagnostic(dir) {
+            const root = fs.realpathSync(tmpdir());
+            const runId = process.env.F387_RUN_ID;
+            assert.equal(root,fs.realpathSync(process.env.F387_DIAGNOSTIC_ROOT));
+            assert.match(runId,/^[0-9]+-1-id88$/);
+            assert.equal(path.basename(root),'f387-id88-'+runId);
+            assert.equal(path.dirname(fs.realpathSync(dir)),root);
+            assert(isProtected(dir));
+            fs.writeFileSync(path.join(root,'worker-handoff.json'),JSON.stringify({runId,dir:path.basename(dir),registeredAt:new Date().toISOString(),pid:process.pid}),{flag:'wx'});
+          }
+          export function observeAndPreserve(dir) {
+            const startedAt = new Date().toISOString();
+            let observation;
+            try {
+              assert(isProtected(dir));
+              const shell = path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+              const probe = fileURLToPath(new URL('./f387-id88-probe.ps1',import.meta.url));
+              observation = JSON.parse(execFileSync(shell,['-NoProfile','-NonInteractive','-File',probe,dir],{encoding:'utf8',windowsHide:true}));
+            } catch (error) { observation = { probeError:String(error.message) }; }
+            fs.writeFileSync(path.join(tmpdir(),'pre-cleanup.json'),JSON.stringify({startedAt,observedAt:new Date().toISOString(),pid:process.pid,recursiveRemovalSuppressed:true,observation}),{flag:'wx'});
+          }
+          '@ | Set-Content -LiteralPath $overlay -Encoding utf8
+          @'
+          param([string]$Directory)
+          $ErrorActionPreference = 'Stop'
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          using Microsoft.Win32.SafeHandles;
+          public static class ID88Access {
+            [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+            private static extern SafeFileHandle CreateFile(string p,uint a,uint s,IntPtr sa,uint d,uint f,IntPtr t);
+            public static int Probe(string p,uint a) {
+              using(var h=CreateFile(p,a,7,IntPtr.Zero,3,0x02200000,IntPtr.Zero)) {
+                return h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+              }
+            }
+          }
+          "@
+          $rows = foreach ($name in 'conversations.db','conversations.db-wal','conversations.db-shm') {
+            $p = Join-Path $Directory $name
+            [ordered]@{ name=$name; readWin32=[ID88Access]::Probe($p,1); deleteAccessWin32=[ID88Access]::Probe($p,65536) }
+          }
+          ConvertTo-Json -InputObject @($rows) -Compress
+          '@ | Set-Content -LiteralPath $probe -Encoding utf8
+          @'
+          import path from 'node:path';
+          import { fileURLToPath } from 'node:url';
+          const root = path.dirname(fileURLToPath(import.meta.url));
+          const run = process.env.F387_DIAGNOSTIC_ROOT;
+          if (!run) throw Error('Missing diagnostic root');
+          const aliased = {'@main':'src/main','@renderer':'src/renderer','@shared':'src/shared','@preload':'src/preload','@packs':'src/packs','generated/prisma/client':'src/generated/prisma/client.ts'};
+          const alias = Object.fromEntries(Object.entries(aliased).map(([k,v])=>[k,path.join(root,v)]));
+          export default {root,cacheDir:path.join(run,'vite-cache'),envDir:false,resolve:{alias},optimizeDeps:{exclude:['@neuronection/assistant-ui']},test:{
+            include:['tests/database-migration.test.ts'],setupFiles:['tests/setup/canvas.ts','tests/setup/react-env.ts'],environment:'node',allowOnly:true,testTimeout:30000,hookTimeout:20000,maxWorkers:1,watch:false,fileParallelism:false,cache:false,fsModuleCache:false,coverage:{enabled:false},retry:0,api:false,ui:false,open:false,pool:'forks',attachmentsDir:path.join(run,'attachments')
+          }};
+          '@ | Set-Content -LiteralPath $config -Encoding utf8
+          @'
+          const assert = require('node:assert/strict');
+          const path = require('node:path');
+          const fs = require('node:fs');
+          const { execFileSync, spawnSync } = require('node:child_process');
+          const [repo,temp,runId,sid] = process.argv.slice(2);
+          assert.match(runId,/^[0-9]+-1-id88$/);
+          assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
+          const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
+          assert(execFileSync(whoami,['/user'],{encoding:'utf8'}).includes(sid));
+          assert(!execFileSync(whoami,['/groups'],{encoding:'utf8'}).includes('S-1-5-32-544'));
+          assert.throws(()=>{const fd=fs.openSync(path.join(repo,'package-lock.json'),'r+');fs.closeSync(fd);},{code:/^(EACCES|EPERM)$/});
+          const casePattern = '^schema boot after the plan-36 flatten > lifts a v0\\.9\\.0 profile \\(no head\\) to the schema head and keeps its data$';
+          const env = {...process.env,TEMP:temp,TMP:temp,TMPDIR:temp,F387_DIAGNOSTIC_ROOT:temp,F387_RUN_ID:runId};
+          const lock = JSON.parse(fs.readFileSync(path.join(repo,'node_modules/@prisma/adapter-libsql/node_modules/@libsql/client/package.json'),'utf8'));
+          assert.equal(process.version,'v24.22.3'); assert.equal(lock.version,'0.17.4');
+          const proc = spawnSync(process.execPath,[path.join(repo,'node_modules/vitest/vitest.mjs'),'run','tests/database-migration.test.ts','--config',path.join(repo,'f387-id88.config.mjs'),'--configLoader','runner','--testNamePattern',casePattern,'--maxWorkers','1','--no-file-parallelism','--no-cache','--reporter','verbose','--reporter','json','--outputFile.json',path.join(temp,'result.json')],{cwd:repo,env,stdio:'inherit',windowsHide:true});
+          if (proc.error) throw proc.error;
+          process.exitCode = proc.status ?? 1;
+          '@ | Set-Content -LiteralPath $launch -Encoding utf8
+          $node = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
+          if ((& $node --version) -cne 'v24.22.3') { throw 'Worker executable version mismatch' }
+          $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
+          $argsForWorker = '"{0}" "{1}" "{2}" "{3}" "{4}"' -f $launch,$repo,$temp.FullName,$runId,$worker.SID.Value
+          $stdout = Join-Path $sealed.FullName 'worker.stdout.txt'
+          $stderr = Join-Path $sealed.FullName 'worker.stderr.txt'
+          $proc = Start-Process -FilePath $node -ArgumentList $argsForWorker -Credential $cred -UseNewEnvironment -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
+          Get-Content -LiteralPath $stdout
+          Get-Content -LiteralPath $stderr
+          $handoff = Join-Path $temp.FullName 'worker-handoff.json'
+          $sources = @{}
+          foreach ($name in 'worker-handoff.json','pre-cleanup.json','result.json') {
+            $candidate = Join-Path $temp.FullName $name
+            if (Test-Path -LiteralPath $candidate) { $sources[$name] = $candidate }
+          }
+          if (Test-Path -LiteralPath $handoff -PathType Leaf) {
+            $h = Get-Content -LiteralPath $handoff -Raw | ConvertFrom-Json
+            if ($h.runId -cne $runId -or $h.dir -cnotmatch '^db-v090-lift-[A-Za-z0-9]+$') { throw 'Invalid handoff' }
+            $directory = Get-Item -LiteralPath (Join-Path $temp.FullName $h.dir) -Force
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Invalid source directory' }
+            foreach ($name in 'conversations.db','conversations.db-wal','conversations.db-shm') {
+              $candidate = Join-Path $directory.FullName $name
+              if (Test-Path -LiteralPath $candidate) { $sources[$name] = $candidate }
+            }
+          }
+          $held=@{}
+          try {
+            foreach ($name in $sources.Keys) {
+              $item = Get-Item -LiteralPath $sources[$name] -Force
+              if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 10000000) { throw 'Invalid file in seal inventory' }
+              $held[$name] = [IO.File]::Open($item.FullName,'Open','Read','Read')
+            }
+            foreach ($name in $held.Keys) {
+              $out = [IO.File]::Open((Join-Path $sealed.FullName $name),'CreateNew','Write','None')
+              try { $held[$name].CopyTo($out) } finally { $out.Dispose() }
+            }
+          } finally { foreach ($stream in $held.Values) { $stream.Dispose() } }
+          $inventory = @(Get-ChildItem -LiteralPath $sealed.FullName -File | Sort-Object Name | ForEach-Object { [ordered]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()} })
+          $manifest = Join-Path $sealed.FullName 'manifest.json'
+          [ordered]@{runId=$runId;workerSid=$worker.SID.Value;collectorSid=$collector.Value;exitCode=$proc.ExitCode;sourceSha='91daf54c96935a8b69a84d4f364a831ccf120d61';files=$inventory} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifest -Encoding utf8
+          "sealed=$($sealed.FullName)" >> $env:GITHUB_OUTPUT
+          "manifest_sha=$((Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          Write-Output "ID 88 worker exit $($proc.ExitCode); original synthetic fixture is retained"
+      - name: Upload only sealed ID 88 evidence
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.seal.outputs.sealed }}/manifest.json
+            ${{ steps.seal.outputs.sealed }}/worker.stdout.txt
+            ${{ steps.seal.outputs.sealed }}/worker.stderr.txt
+            ${{ steps.seal.outputs.sealed }}/worker-handoff.json
+            ${{ steps.seal.outputs.sealed }}/pre-cleanup.json
+            ${{ steps.seal.outputs.sealed }}/result.json
+            ${{ steps.seal.outputs.sealed }}/conversations.db
+            ${{ steps.seal.outputs.sealed }}/conversations.db-wal
+            ${{ steps.seal.outputs.sealed }}/conversations.db-shm
+          retention-days: 14
+          if-no-files-found: error
+          overwrite: false
+
+  id88_verify:
+    needs: id88
+    if: ${{ always() && needs.id88.outputs.archive_id != '' }}
+    runs-on: windows-2022
+    permissions: {}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/id88-download-${{ env.F386_RUN }}
+      - name: Verify the one selected result and restore a fresh copy
+        shell: pwsh
+        env:
+          MANIFEST_SHA: ${{ needs.id88.outputs.manifest_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dir = Join-Path $env:RUNNER_TEMP "id88-download-$env:F386_RUN"
+          $manifest = Join-Path $dir 'manifest.json'
+          if ((Get-FileHash -LiteralPath $manifest).Hash -ine $env:MANIFEST_SHA) { throw 'Manifest mismatch' }
+          $doc = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          if ($doc.runId -cne "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-id88" -or $doc.workerSid -ceq $doc.collectorSid) { throw 'Run or identity mismatch' }
+          $allowed = @('worker.stdout.txt','worker.stderr.txt','worker-handoff.json','pre-cleanup.json','result.json','conversations.db','conversations.db-wal','conversations.db-shm')
+          foreach ($f in $doc.files) {
+            if ($f.name -cnotin $allowed) { throw 'Unexpected filename' }
+            $p = Join-Path $dir $f.name
+            if ((Get-Item -LiteralPath $p).Length -ne $f.bytes -or (Get-FileHash -LiteralPath $p).Hash -ine $f.sha256) { throw 'File mismatch' }
+          }
+          if (@(Compare-Object @($doc.files.name + 'manifest.json' | Sort-Object) @(Get-ChildItem -LiteralPath $dir -Force | Select-Object -ExpandProperty Name | Sort-Object) -CaseSensitive).Count) { throw 'Archive inventory mismatch' }
+          if (-not (Test-Path -LiteralPath (Join-Path $dir 'result.json'))) { throw 'Diagnostic runner produced no Vitest result; inspect retained evidence' }
+          $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
+          $ran = @($result.testResults.assertionResults | Where-Object { $_.status -in 'passed','failed' })
+          $expectedCase = 'schema boot after the plan-36 flatten > lifts a v0.9.0 profile (no head) to the schema head and keeps its data'
+          if ($ran.Count -ne 1 -or $ran[0].fullName -cne $expectedCase) { throw 'Exact one-case scope not verified' }
+          Write-Output "ID 88 outcome $($ran[0].status); skipped $($result.numPendingTests); worker exit $($doc.exitCode)"
+          if (Test-Path -LiteralPath (Join-Path $dir 'pre-cleanup.json')) { Get-Content -LiteralPath (Join-Path $dir 'pre-cleanup.json') }
+          if ($ran[0].status -ne 'passed' -or $doc.exitCode -ne 0) { throw 'ID 88 did not pass; original evidence retained' }
+          $script = Join-Path $env:RUNNER_TEMP 'f387-id88-restore.cjs'
+          @'
+          const fs=require('node:fs'); const path=require('node:path'); const os=require('node:os');
+          const assert=require('node:assert/strict'); const {DatabaseSync}=require('node:sqlite');
+          const input=process.argv[2]; const root=fs.mkdtempSync(path.join(os.tmpdir(),'id88-restore-'));
+          for (const name of ['conversations.db','conversations.db-wal','conversations.db-shm']) {
+            const p=path.join(input,name);
+            if (name==='conversations.db'||fs.existsSync(p)) fs.copyFileSync(p,path.join(root,name),fs.constants.COPYFILE_EXCL);
+          }
+          const db=new DatabaseSync(path.join(root,'conversations.db'));
+          try {
+            const integrity=db.prepare('PRAGMA integrity_check').get().integrity_check;
+            const version=db.prepare('PRAGMA user_version').get().user_version;
+            const conversation=db.prepare("SELECT id,title,activeRootId FROM Conversation WHERE id='conv-legacy'").get();
+            const message=db.prepare("SELECT id,content,parentId,activeChildId FROM Message WHERE id='msg-legacy'").get();
+            assert.equal(integrity,'ok'); assert.equal(version,7);
+            assert.deepEqual({...conversation},{id:'conv-legacy',title:'Before the head',activeRootId:null});
+            assert.deepEqual({...message},{id:'msg-legacy',content:'Kept across the lift',parentId:null,activeChildId:null});
+            console.log(JSON.stringify({integrity,version,conversation,message}));
+          } finally { db.close(); }
+          '@ | Set-Content -LiteralPath $script -Encoding utf8
+          node $script $dir
