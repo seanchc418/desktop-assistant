@@ -216,9 +216,32 @@ jobs:
   wal_capture:
     if: github.repository == 'seanchc418/desktop-assistant'
     runs-on: windows-2022
-    permissions: {}
-    timeout-minutes: 10
+    permissions:
+      contents: read
+    timeout-minutes: 16
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 91daf54c96935a8b69a84d4f364a831ccf120d61
+          path: f387-prisma-source
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.22.3'
+          architecture: x64
+      - name: Install locked packages and generate Prisma Client only
+        shell: pwsh
+        working-directory: f387-prisma-source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((git rev-parse HEAD) -cne '91daf54c96935a8b69a84d4f364a831ccf120d61') { throw 'Unexpected source' }
+          $before = (Get-FileHash -LiteralPath 'package-lock.json').Hash
+          if ((node --version) -cne 'v24.22.3' -or (npx.cmd --yes npm@11.6.2 --version) -cne '11.6.2') { throw 'Unexpected toolchain' }
+          npx.cmd --yes npm@11.6.2 ci --ignore-scripts --no-audit --no-fund
+          node node_modules/prisma/build/index.js generate --schema prisma/schema.prisma
+          if (-not (Test-Path -LiteralPath 'src/generated/prisma/client.ts' -PathType Leaf) -or (Get-FileHash -LiteralPath 'package-lock.json').Hash -cne $before) { throw 'Generated client missing or lockfile changed' }
+          Write-Output "F387 setup Node v24.22.3 npm 11.6.2 lockfile SHA-256 $before"
       - name: Worker writes WAL, collector freezes and seals synthetic files
         id: seal
         shell: pwsh
@@ -243,6 +266,15 @@ jobs:
           }
           $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
           Set-Acl -LiteralPath $root -AclObject $acl
+          $repo = Join-Path $env:GITHUB_WORKSPACE 'f387-prisma-source'
+          $repoAcl = [Security.AccessControl.DirectorySecurity]::new()
+          $repoAcl.SetOwner($collector)
+          $repoAcl.SetAccessRuleProtection($true,$false)
+          foreach ($sid in @($collector,[Security.Principal.SecurityIdentifier]::new('S-1-5-18'))) {
+            $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+          }
+          $repoAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow'))
+          Set-Acl -LiteralPath $repo -AclObject $repoAcl
           $inbox = New-Item -ItemType Directory -Path (Join-Path $root 'inbox')
           $sealed = New-Item -ItemType Directory -Path (Join-Path $root 'sealed')
           $inboxAcl = Get-Acl -LiteralPath $inbox.FullName
@@ -258,7 +290,7 @@ jobs:
           const path = require('node:path');
           const { execFileSync } = require('node:child_process');
           const { DatabaseSync } = require('node:sqlite');
-          const [inbox, marker, expectedUser, expectedSid, tag] = process.argv.slice(2);
+          const [inbox, marker, expectedUser, expectedSid, tag, repo] = process.argv.slice(2);
           assert.equal(os.userInfo().username.toLowerCase(), expectedUser.toLowerCase());
           assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
           const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
@@ -267,7 +299,34 @@ jobs:
           const groups = execFileSync(whoami,['/groups','/fo','csv','/nh'],{encoding:'utf8'});
           assert(!groups.includes('S-1-5-32-544'));
           assert.throws(() => { const fd = fs.openSync(marker,'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
-          function runFixture(mode) {
+          assert.throws(() => { const fd = fs.openSync(path.join(repo,'package-lock.json'),'r+'); fs.closeSync(fd); }, { code: /^(EACCES|EPERM)$/ });
+          const Module = require('node:module');
+          const { pathToFileURL } = require('node:url');
+          const fromRepo = Module.createRequire(path.join(repo,'package.json'));
+          const generated = path.join(repo,'src/generated/prisma');
+          const ts = fromRepo('typescript');
+          const oldTs = Module._extensions['.ts'];
+          Module._extensions['.ts'] = (mod, filename) => {
+            const relative = path.relative(generated,filename);
+            assert(relative && !path.isAbsolute(relative) && !relative.startsWith('..'));
+            const result = ts.transpileModule(fs.readFileSync(filename,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}});
+            mod._compile(result.outputText,filename);
+          };
+          let PrismaClient;
+          try { ({ PrismaClient } = fromRepo(path.join(generated,'client.ts'))); }
+          finally { if (oldTs) Module._extensions['.ts']=oldTs; else delete Module._extensions['.ts']; }
+          const { PrismaLibSql } = fromRepo('@prisma/adapter-libsql');
+          const adapterPackage = path.join(repo,'node_modules/@prisma/adapter-libsql/package.json');
+          const clientPackage = path.join(path.dirname(adapterPackage),'node_modules/@libsql/client/package.json');
+          const resolvedClient = Module.createRequire(adapterPackage).resolve('@libsql/client');
+          const version = filename => JSON.parse(fs.readFileSync(filename,'utf8')).version;
+          assert.equal(version(adapterPackage),'7.10.0');
+          assert.equal(version(path.join(repo,'node_modules/@prisma/client/package.json')),'7.10.0');
+          assert.equal(version(clientPackage),'0.17.4');
+          assert(resolvedClient.startsWith(path.dirname(clientPackage)+path.sep));
+          assert.equal(version(path.join(repo,'node_modules/@libsql/win32-x64-msvc/package.json')),'0.5.29');
+          console.log('F387 locked adapter 7.10.0, nested client 0.17.4, Windows native 0.5.29; worker source write denied');
+          async function runFixture(mode) {
             const runId = tag + '-' + mode;
             const root = path.join(inbox, 'f387-id88-' + runId);
             fs.mkdirSync(root);
@@ -287,18 +346,29 @@ jobs:
               let initFailure = false;
               let finallyPreserved = false;
               let hookPreserved = false;
-              function openFixture() {
-                const pending = new DatabaseSync(dbPath);
-                if (mode === 'partial') {
-                  try { pending.exec("CREATE TABLE partial(id INTEGER PRIMARY KEY); INSERT INTO partial VALUES(1);"); }
-                  finally { pending.close(); }
-                  throw Error('synthetic initialization before client assignment');
-                }
-                return pending;
+              async function openFixture() {
+                const pending = new PrismaClient({ adapter:new PrismaLibSql({url:pathToFileURL(dbPath).href}) });
+                try {
+                  await pending.$connect();
+                  if (mode === 'partial') {
+                    await pending.$executeRawUnsafe('CREATE TABLE partial(id INTEGER PRIMARY KEY)');
+                    await pending.$executeRawUnsafe('INSERT INTO partial VALUES(1)');
+                    throw Error('synthetic initialization before client assignment');
+                  }
+                  return pending;
+                } catch (error) { await pending.$disconnect(); throw error; }
               }
               try {
-                db = openFixture();
-                db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO synthetic VALUES(1,'checkpointed'); PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO synthetic VALUES(2,'wal-only');");
+                db = await openFixture();
+                const engine = (await db.$queryRawUnsafe('SELECT sqlite_version() AS version'))[0].version;
+                console.log('F387 generated Prisma Client connected to native SQLite '+engine);
+                await db.$queryRawUnsafe('PRAGMA journal_mode=WAL');
+                await db.$queryRawUnsafe('PRAGMA wal_autocheckpoint=0');
+                await db.$executeRawUnsafe('CREATE TABLE synthetic(id INTEGER PRIMARY KEY, value TEXT NOT NULL)');
+                await db.$executeRawUnsafe("INSERT INTO synthetic VALUES(1,'checkpointed')");
+                await db.$queryRawUnsafe('PRAGMA wal_checkpoint(TRUNCATE)');
+                await db.$executeRawUnsafe("INSERT INTO synthetic VALUES(2,'wal-only')");
+                assert.equal((await db.$queryRawUnsafe('SELECT id FROM synthetic ORDER BY id')).length,2);
                 const candidate = path.join(dir, 'candidate');
                 fs.mkdirSync(candidate);
                 for (const suffix of ['', '-wal', '-shm']) fs.copyFileSync(dbPath+suffix,path.join(candidate,'conversations.db'+suffix),fs.constants.COPYFILE_EXCL);
@@ -306,7 +376,7 @@ jobs:
                 if (mode !== 'partial' || db || error.message !== 'synthetic initialization before client assignment') throw error;
                 initFailure = true;
               } finally {
-                if (db) db.close();
+                if (db) await db.$disconnect();
                 // Exercise the diagnostic finally route, which delegates rather than deleting.
                 assert(fs.statSync(dbPath).size > 0);
                 assert(fs.existsSync(path.join(dir, 'cleanup.marker')));
@@ -322,16 +392,18 @@ jobs:
             } finally { process.env.TEMP = priorTemp; }
           }
           assert(/^[0-9]+-[0-9]+$/.test(tag));
-          const handoffs = ['success','partial'].map(runFixture);
-          fs.writeFileSync(path.join(inbox,'handoff-report.json'),JSON.stringify({tag,handoffs}),{flag:'wx'});
-          console.log('F387 registered before open; finally and afterEach preserved both fixtures; partial initialization failed before assignment');
+          (async () => {
+            const handoffs = [await runFixture('success'),await runFixture('partial')];
+            fs.writeFileSync(path.join(inbox,'handoff-report.json'),JSON.stringify({tag,handoffs}),{flag:'wx'});
+            console.log('F387 Prisma registered before open; finally and afterEach preserved both fixtures; partial initialization failed before assignment');
+          })().catch(error => { console.error(error); process.exitCode=1; });
           '@ | Set-Content -LiteralPath $script -Encoding utf8
           $scriptAcl = Get-Acl -LiteralPath $script
           $scriptAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($worker.SID,'ReadAndExecute','Allow'))
           Set-Acl -LiteralPath $script -AclObject $scriptAcl
           $nodeExe = (Get-Command node -CommandType Application).Source
           $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
-          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value,$tag
+          $workerArgs = '"{0}" "{1}" "{2}" "{3}" "{4}" "{5}" "{6}"' -f $script,$inbox.FullName,$marker,$account,$worker.SID.Value,$tag,$repo
           $stdout = Join-Path $root 'worker.log'
           $stderr = Join-Path $root 'worker.err'
           $process = Start-Process -FilePath $nodeExe -ArgumentList $workerArgs -Credential $cred -UseNewEnvironment -WorkingDirectory $inbox.FullName -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
@@ -453,7 +525,7 @@ jobs:
     if: github.repository == 'seanchc418/desktop-assistant'
     runs-on: windows-2022
     permissions: {}
-    timeout-minutes: 10
+    timeout-minutes: 14
     steps:
       - name: Wait for this run's sealed source
         id: locate
@@ -464,7 +536,7 @@ jobs:
           $pattern = '^wal-source-' + [regex]::Escape($tag) + '-([0-9a-f]{64})$'
           $uri = "https://api.github.com/repos/seanchc418/desktop-assistant/actions/runs/$env:GITHUB_RUN_ID/artifacts?per_page=30"
           $source = $null
-          for ($i=0; $i -lt 16; $i++) {
+          for ($i=0; $i -lt 50; $i++) {
             try { $published = Invoke-RestMethod -Uri $uri -TimeoutSec 8; $source = $published.artifacts | Where-Object { $_.name -cmatch $pattern -and -not $_.expired -and $_.size_in_bytes -gt 0 } | Select-Object -First 1 } catch { Write-Output 'Source listing temporarily unavailable' }
             if ($source) { break }
             Start-Sleep -Seconds 10
