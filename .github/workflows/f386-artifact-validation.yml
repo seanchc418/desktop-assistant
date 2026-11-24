@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Trace approved ID 88 lifecycle once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -637,7 +637,7 @@ jobs:
           overwrite: false
 
   id88:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Trace approved ID 88 lifecycle once' && github.run_attempt == 1
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Compare approved ID 88 GC once' && github.run_attempt == 1
     runs-on: windows-2022
     permissions:
       contents: read
@@ -765,7 +765,7 @@ jobs:
           $assignment = "    dir = legacyDir;" + [char]10
           $remove = '      await rm(legacyDir, { recursive: true, force: true });'
           if (-not $targetBody.Contains($assignment) -or -not $targetBody.Contains($remove)) { throw 'ID 88 cleanup anchors not found' }
-          $targetBody = $targetBody.Replace($caseMatch,"  it.only('$case', async () => {").Replace($assignment,"    registerDiagnostic(legacyDir);" + [char]10).Replace($remove,'      observeAndPreserve(legacyDir);')
+          $targetBody = $targetBody.Replace($caseMatch,"  it.only('$case', async () => {").Replace($assignment,"    registerDiagnostic(legacyDir);" + [char]10).Replace($remove,'      await observeAndPreserve(legacyDir);')
           if ($targetBody -match '\brm\(' -or $targetBody -match '\bdir\s*=\s*legacyDir' -or $targetBody.IndexOf('registerDiagnostic') -ge $targetBody.IndexOf('await openDatabase')) { throw 'Unsafe focused overlay' }
           $prefix = $original.Substring(0,$i)
           $hookOriginal = '      await rm(dir, { recursive: true, force: true });'
@@ -791,7 +791,7 @@ jobs:
             assert(isProtected(dir));
             fs.writeFileSync(path.join(root,'worker-handoff.json'),JSON.stringify({runId,dir:path.basename(dir),registeredAt:new Date().toISOString(),pid:process.pid}),{flag:'wx'});
           }
-          export function observeAndPreserve(dir) {
+          export async function observeAndPreserve(dir) {
             const startedAt = new Date().toISOString();
             let observation;
             try {
@@ -803,6 +803,16 @@ jobs:
             fs.writeFileSync(path.join(tmpdir(),'pre-cleanup.json'),JSON.stringify({startedAt,observedAt:new Date().toISOString(),pid:process.pid,recursiveRemovalSuppressed:true,observation}),{flag:'wx'});
             const trace=path.join(tmpdir(),'lifecycle.jsonl');
             fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event:'cleanup.probe.complete'})+'\n');
+            assert.equal(typeof globalThis.gc,'function','GC must be explicitly exposed in this diagnostic worker');
+            const emit=(event,data={})=>fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event,...data})+'\n');
+            emit('gc.intervention.begin');
+            globalThis.gc();
+            await new Promise(resolve=>setTimeout(resolve,100));
+            emit('gc.intervention.yielded');
+            const shell = path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+            const probe = fileURLToPath(new URL('./f387-id88-probe.ps1',import.meta.url));
+            const afterGc=JSON.parse(execFileSync(shell,['-NoProfile','-NonInteractive','-File',probe,dir],{encoding:'utf8',windowsHide:true}));
+            emit('gc.probe.complete',{observation:afterGc});
           }
           '@ | Set-Content -LiteralPath $overlay -Encoding utf8
           @'
@@ -873,7 +883,7 @@ jobs:
           const aliased = {'@main':'src/main','@renderer':'src/renderer','@shared':'src/shared','@preload':'src/preload','@packs':'src/packs','generated/prisma/client':'src/generated/prisma/client.ts'};
           const alias = Object.fromEntries(Object.entries(aliased).map(([k,v])=>[k,path.join(root,v)]));
           export default {root,cacheDir:path.join(run,'vite-cache'),envDir:false,resolve:{alias},optimizeDeps:{exclude:['@neuronection/assistant-ui']},test:{
-            include:['tests/database-migration.test.ts'],setupFiles:['tests/setup/canvas.ts','tests/setup/react-env.ts'],environment:'node',allowOnly:true,testTimeout:30000,hookTimeout:20000,maxWorkers:1,watch:false,fileParallelism:false,cache:false,fsModuleCache:false,coverage:{enabled:false},retry:0,api:false,ui:false,open:false,pool:'forks',attachmentsDir:path.join(run,'attachments')
+            include:['tests/database-migration.test.ts'],setupFiles:['tests/setup/canvas.ts','tests/setup/react-env.ts'],environment:'node',allowOnly:true,testTimeout:30000,hookTimeout:20000,maxWorkers:1,watch:false,fileParallelism:false,cache:false,fsModuleCache:false,coverage:{enabled:false},retry:0,api:false,ui:false,open:false,pool:'forks',execArgv:['--expose-gc'],attachmentsDir:path.join(run,'attachments')
           }};
           '@ | Set-Content -LiteralPath $config -Encoding utf8
           @'
@@ -999,6 +1009,10 @@ jobs:
           $close=@($events | Where-Object event -ceq 'native.close.return')
           $disconnect=@($events | Where-Object event -ceq 'prisma.disconnect.resolved')
           if ($close.Count -lt 2 -or $disconnect.Count -lt 2) { throw 'Lifecycle instrumentation absent' }
+          $gcBegin=@($events | Where-Object event -ceq 'gc.intervention.begin')
+          $gcProbe=@($events | Where-Object event -ceq 'gc.probe.complete')
+          $cleanupProbe=@($events | Where-Object event -ceq 'cleanup.probe.complete')
+          if ($gcBegin.Count -ne 1 -or $gcProbe.Count -ne 1 -or $cleanupProbe.Count -ne 1 -or $gcBegin[0].pid -ne $gcProbe[0].pid -or $gcProbe[0].pid -ne $cleanupProbe[0].pid) { throw 'GC scope or same-process identity not verified' }
           foreach ($event in $events | Where-Object { $_.event -notin @('statement.prepared','statement.wrapper-finalized') }) { Write-Output ('Lifecycle '+($event | ConvertTo-Json -Compress)) }
           Write-Output ('Statement counts '+(@($events | Group-Object event | Select-Object Name,Count) | ConvertTo-Json -Compress))
           $result = Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw | ConvertFrom-Json
