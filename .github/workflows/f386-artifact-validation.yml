@@ -15,7 +15,7 @@ env:
 
 jobs:
   upload:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     timeout-minutes: 10
     outputs:
@@ -73,7 +73,7 @@ jobs:
 
 
   identity:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 10
@@ -214,7 +214,7 @@ jobs:
 
 
   wal_capture:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions:
       contents: read
@@ -523,7 +523,7 @@ jobs:
           Write-Output "F387 receipt artifact $($receipt.id) confirmed; only original success marker removed; partial marker and sealed files retained"
 
   wal_verify:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Compare approved ID 88 GC once' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message != 'Resolve ID 88 cleanup with paired lifetime evidence' && github.event.head_commit.message != 'Verify retained ID 88 artifact only'
     runs-on: windows-2022
     permissions: {}
     timeout-minutes: 14
@@ -637,14 +637,22 @@ jobs:
           overwrite: false
 
   id88:
-    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Compare approved ID 88 GC once' && github.run_attempt == 1
+    if: github.repository == 'seanchc418/desktop-assistant' && github.event.head_commit.message == 'Resolve ID 88 cleanup with paired lifetime evidence' && github.run_attempt == 1
     runs-on: windows-2022
     permissions:
       contents: read
     timeout-minutes: 16
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [wait, gc]
+    env:
+      F387_GC_MODE: ${{ matrix.mode }}
     outputs:
       archive_id: ${{ steps.upload.outputs.artifact-id }}
       manifest_sha: ${{ steps.seal.outputs.manifest_sha }}
+      manifest_sha_wait: ${{ steps.seal.outputs.manifest_sha_wait }}
+      manifest_sha_gc: ${{ steps.seal.outputs.manifest_sha_gc }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -805,8 +813,9 @@ jobs:
             fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event:'cleanup.probe.complete'})+'\n');
             assert.equal(typeof globalThis.gc,'function','GC must be explicitly exposed in this diagnostic worker');
             const emit=(event,data={})=>fs.appendFileSync(trace,JSON.stringify({time:new Date().toISOString(),pid:process.pid,event,...data})+'\n');
-            emit('gc.intervention.begin');
-            globalThis.gc();
+            assert(['wait','gc'].includes(process.env.F387_GC_MODE));
+            emit('intervention.begin',{mode:process.env.F387_GC_MODE});
+            if(process.env.F387_GC_MODE==='gc') globalThis.gc();
             await new Promise(resolve=>setTimeout(resolve,100));
             emit('gc.intervention.yielded');
             const shell = path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
@@ -891,7 +900,8 @@ jobs:
           const path = require('node:path');
           const fs = require('node:fs');
           const { execFileSync, spawnSync } = require('node:child_process');
-          const [repo,temp,runId,sid] = process.argv.slice(2);
+          const [repo,temp,runId,sid,mode] = process.argv.slice(2);
+          assert(['wait','gc'].includes(mode));
           assert.match(runId,/^[0-9]+-1-id88$/);
           assert(!process.env.GITHUB_TOKEN && !process.env.ACTIONS_RUNTIME_TOKEN);
           const whoami = path.join(process.env.SystemRoot,'System32','whoami.exe');
@@ -899,7 +909,7 @@ jobs:
           assert(!execFileSync(whoami,['/groups'],{encoding:'utf8'}).includes('S-1-5-32-544'));
           assert.throws(()=>{const fd=fs.openSync(path.join(repo,'package-lock.json'),'r+');fs.closeSync(fd);},{code:/^(EACCES|EPERM)$/});
           const casePattern = '^schema boot after the plan-36 flatten > lifts a v0\\.9\\.0 profile \\(no head\\) to the schema head and keeps its data$';
-          const env = {...process.env,TEMP:temp,TMP:temp,TMPDIR:temp,F387_DIAGNOSTIC_ROOT:temp,F387_RUN_ID:runId};
+          const env = {...process.env,TEMP:temp,TMP:temp,TMPDIR:temp,F387_DIAGNOSTIC_ROOT:temp,F387_RUN_ID:runId,F387_GC_MODE:mode};
           const lock = JSON.parse(fs.readFileSync(path.join(repo,'node_modules/@prisma/adapter-libsql/node_modules/@libsql/client/package.json'),'utf8'));
           assert.equal(process.version,'v24.22.3'); assert.equal(lock.version,'0.17.4');
           const proc = spawnSync(process.execPath,[path.join(repo,'node_modules/vitest/vitest.mjs'),'run','tests/database-migration.test.ts','--config',path.join(repo,'f387-id88.config.mjs'),'--configLoader','runner','--testNamePattern',casePattern,'--maxWorkers','1','--no-file-parallelism','--no-cache','--reporter','verbose','--reporter','json','--outputFile.json',path.join(temp,'result.json')],{cwd:repo,env,stdio:'inherit',windowsHide:true});
@@ -909,7 +919,7 @@ jobs:
           $node = (Get-Command node.exe -CommandType Application | Select-Object -First 1).Source
           if ((& $node --version) -cne 'v24.22.3') { throw 'Worker executable version mismatch' }
           $cred = [pscredential]::new("$env:COMPUTERNAME\$account",$password)
-          $argsForWorker = '"{0}" "{1}" "{2}" "{3}" "{4}"' -f $launch,$repo,$temp.FullName,$runId,$worker.SID.Value
+          $argsForWorker = '"{0}" "{1}" "{2}" "{3}" "{4}" "{5}"' -f $launch,$repo,$temp.FullName,$runId,$worker.SID.Value,$env:F387_GC_MODE
           $stdout = Join-Path $sealed.FullName 'worker.stdout.txt'
           $stderr = Join-Path $sealed.FullName 'worker.stderr.txt'
           $proc = Start-Process -FilePath $node -ArgumentList $argsForWorker -Credential $cred -UseNewEnvironment -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
@@ -949,15 +959,16 @@ jobs:
           } finally { foreach ($stream in $held.Values) { $stream.Dispose() } }
           $inventory = @(Get-ChildItem -LiteralPath $sealed.FullName -File | Sort-Object Name | ForEach-Object { [ordered]@{name=$_.Name;bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName).Hash.ToLowerInvariant()} })
           $manifest = Join-Path $sealed.FullName 'manifest.json'
-          [ordered]@{runId=$runId;workerSid=$worker.SID.Value;collectorSid=$collector.Value;exitCode=$proc.ExitCode;sourceSha='91daf54c96935a8b69a84d4f364a831ccf120d61';files=$inventory} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifest -Encoding utf8
+          [ordered]@{runId=$runId;mode=$env:F387_GC_MODE;workerSid=$worker.SID.Value;collectorSid=$collector.Value;exitCode=$proc.ExitCode;sourceSha='91daf54c96935a8b69a84d4f364a831ccf120d61';files=$inventory} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifest -Encoding utf8
           "sealed=$($sealed.FullName)" >> $env:GITHUB_OUTPUT
           "manifest_sha=$((Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "manifest_sha_$env:F387_GC_MODE=$((Get-FileHash -LiteralPath $manifest).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Output "ID 88 worker exit $($proc.ExitCode); original synthetic fixture is retained"
       - name: Upload only sealed ID 88 evidence
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: id88-${{ github.run_id }}-${{ github.run_attempt }}
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}
           path: |
             ${{ steps.seal.outputs.sealed }}/manifest.json
             ${{ steps.seal.outputs.sealed }}/worker.stdout.txt
@@ -975,6 +986,10 @@ jobs:
           overwrite: false
 
   id88_verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [wait, gc]
     needs: id88
     if: ${{ always() && needs.id88.outputs.archive_id != '' }}
     runs-on: windows-2022
@@ -983,12 +998,13 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: id88-${{ github.run_id }}-${{ github.run_attempt }}
+          name: id88-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.mode }}
           path: ${{ runner.temp }}/id88-download-${{ env.F386_RUN }}
       - name: Verify the one selected result and restore a fresh copy
         shell: pwsh
         env:
-          MANIFEST_SHA: ${{ needs.id88.outputs.manifest_sha }}
+          MANIFEST_SHA: ${{ needs.id88.outputs[format('manifest_sha_{0}', matrix.mode)] }}
+          EXPECTED_MODE: ${{ matrix.mode }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -1009,7 +1025,8 @@ jobs:
           $close=@($events | Where-Object event -ceq 'native.close.return')
           $disconnect=@($events | Where-Object event -ceq 'prisma.disconnect.resolved')
           if ($close.Count -lt 2 -or $disconnect.Count -lt 2) { throw 'Lifecycle instrumentation absent' }
-          $gcBegin=@($events | Where-Object event -ceq 'gc.intervention.begin')
+          if ($doc.mode -cne $env:EXPECTED_MODE) { throw 'Matrix mode mismatch' }
+          $gcBegin=@($events | Where-Object event -ceq 'intervention.begin')
           $gcProbe=@($events | Where-Object event -ceq 'gc.probe.complete')
           $cleanupProbe=@($events | Where-Object event -ceq 'cleanup.probe.complete')
           if ($gcBegin.Count -ne 1 -or $gcProbe.Count -ne 1 -or $cleanupProbe.Count -ne 1 -or $gcBegin[0].pid -ne $gcProbe[0].pid -or $gcProbe[0].pid -ne $cleanupProbe[0].pid) { throw 'GC scope or same-process identity not verified' }
